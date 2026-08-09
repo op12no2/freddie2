@@ -1,8 +1,10 @@
-# mike
+# Mike
 
 Autonomous outdoor robot.
 
 ## Parts
+
+Excluding build choices and stock components: capacitors, resistors, LEDs, boards, wire, plugs/sockets, switches, batteries, fixings etc.
 
 - [4 off 19:1 Metal Gearmotor 37Dx68L mm 12V with 64 CPR Encoder (Helical Pinion)](https://www.pololu.com/product/4751)
 - [2 off 12mm Hex Wheel Adapter for 6mm Shaft, Extended (2-Pack)](https://www.pololu.com/product/2687)
