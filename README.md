@@ -17,6 +17,7 @@ Excluding build choices and stock components.
 - [ESP32 wiki](https://wiki.dfrobot.com/dfr0994)
 - [LD2410C data sheet](https://www.hlktech.net/index.php?id=1095)
 - [Qwiic buzzer data sheet](https://docs.sparkfun.com/SparkFun_Qwiic_Buzzer/hardware_overview/#qwiic-and-i2c)
+- [Romeo ESP32-S3 board schematic](./docs/DFR0994-schematics-v1.0.pdf)
 - [Freddie 2 Schematic](./freddie2.pdf)
 
 ## Build
@@ -25,6 +26,6 @@ Excluding build choices and stock components.
 cd freddie2
 source ~/esp/esp-idf/export.sh
 idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+idf.py -p /dev/ttyACM0 flash monitor
 ```
 

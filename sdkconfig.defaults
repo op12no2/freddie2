@@ -1,0 +1,14 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# Romeo ESP32-S3 (DFR0994): 16 MB flash (default header assumes 2 MB)
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# 8 MB octal PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+# Don't abort boot if PSRAM init fails; just report none
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# Board's USB-C is the S3's native USB-Serial/JTAG; put the console there
+# so `idf.py monitor` works over the same cable used for flashing.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
