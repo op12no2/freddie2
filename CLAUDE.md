@@ -84,6 +84,13 @@ M4 = back-right, no polarity flips — encoded once in the `FL_CH`/`FL_POL`
 macros in the main file. Mecanum drive means all four wheels get
 independent signed speeds.
 
+Mecanum wheel placement (verified on the floor with the `x` demo): the
+kit's L-labelled wheels go front-left and back-right, R-labelled wheels
+front-right and back-left — same-handed wheels sit on a diagonal, never
+on the same side. Check: viewed from above, the roller diagonals form an
+X converging on the robot's center. Get this wrong and forward/backward
+still works but strafing degrades into dragging.
+
 Motor-related jumpers, all shorted in this build: the PMODE jumper
 (shorted = PH/EN mode, which is what the firmware assumes; open = PWM
 mode) and per-channel EN/PH jumpers (e.g. M1EN/M1PH) that connect the

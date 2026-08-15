@@ -186,10 +186,58 @@ abort:
     printf("wheel test aborted.\n");
 }
 
+/* Floor test: countdown long enough to unplug the USB lead and set the
+ * robot down, then a short mecanum demo — forward/back, strafe both
+ * ways, rotate both ways. Verifies the drive() mix and the roller
+ * orientation, which the bench tests can't show. */
+static void floor_test(int countdown)
+{
+    printf("floor test in %d s — unplug USB and set me down. any key aborts.\n",
+           countdown);
+    for (int s = countdown; s > 0; s--) {
+        printf("%d...\n", s);
+        if (wait_or_key(1000)) {
+            printf("floor test aborted.\n");
+            return;
+        }
+    }
+
+    static const struct { int x, y, r, ms; const char *name; } SEQ[] = {
+        {   0,  50,   0, 1000, "forward" },
+        {   0, -50,   0, 1000, "backward" },
+        {  50,   0,   0, 1000, "strafe right" },
+        { -50,   0,   0, 1000, "strafe left" },
+        {  50,  50,   0, 1000, "diagonal front-right" },
+        { -50, -50,   0, 1000, "diagonal back-left" },
+        { -50,  50,   0, 1000, "diagonal front-left" },
+        {  50, -50,   0, 1000, "diagonal back-right" },
+        {   0,  55,  30, 1500, "arc right, out" },
+        {   0, -55, -30, 1500, "arc right, back" },
+        {   0,  55, -30, 1500, "arc left, out" },
+        {   0, -55,  30, 1500, "arc left, back" },
+        {   0,   0,  50, 1000, "rotate cw" },
+        {   0,   0, -50, 1000, "rotate ccw" },
+    };
+    for (size_t i = 0; i < sizeof SEQ / sizeof SEQ[0]; i++) {
+        printf("%s...\n", SEQ[i].name);
+        drive(SEQ[i].x, SEQ[i].y, SEQ[i].r);
+        if (wait_or_key(SEQ[i].ms)) goto abort;
+        motors_stop();
+        if (wait_or_key(500)) goto abort;
+    }
+    printf("floor test done.\n");
+    return;
+abort:
+    motors_stop();
+    printf("floor test aborted.\n");
+}
+
 static void help(void)
 {
     printf("commands:\n");
     printf("  t                     wheel test: each motor fwd then rev in turn\n");
+    printf("  x [secs]              floor test: countdown (default 5), then\n");
+    printf("                        fwd/back/strafe/rotate demo — unplug USB first\n");
     printf("  m <1-4> <pct> [secs]  one motor, pct -100..100\n");
     printf("  a <pct> [secs]        all motors\n");
     printf("  d <x> <y> <r> [secs]  mecanum drive: x strafe, y fwd, r rotate\n");
@@ -217,6 +265,13 @@ static void handle_line(const char *line)
         break;
     case 't':
         test_wheels();
+        break;
+    case 'x':
+        a = 5;
+        sscanf(line + 1, "%d", &a);
+        if (a < 1) a = 1;
+        if (a > 60) a = 60;
+        floor_test(a);
         break;
     case 'm':
         if (sscanf(line + 1, "%d %d %d", &a, &b, &secs) < 2 || a < 1 || a > 4) {
