@@ -52,6 +52,8 @@ static const struct { int en, ph; } MOTOR_GPIO[MOTOR_N] = {
 
 #define RUN_DEFAULT_S 3   /* auto-stop delay when a command gives no duration */
 
+#define DEMO_JUMPER_GPIO 48   /* grounded at boot = run the floor demo */
+
 static int motor_pct[MOTOR_N];    /* last commanded values, for `v` */
 static int64_t motor_stop_at_us;  /* 0 = no auto-stop pending */
 
@@ -322,6 +324,21 @@ void app_main(void)
 
     motors_init();
     ESP_LOGI(TAG, "motors ready (VM must be powered for wheels to turn)");
+
+    /* Demo-on-boot jumper: if GPIO 48 (header P18, internal pull-up) is
+     * patched to GND at power-on, run the floor demo after a countdown.
+     * Lets the robot perform on battery alone, no console attached. */
+    gpio_config_t jumper = {
+        .pin_bit_mask = 1ULL << DEMO_JUMPER_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&jumper));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    if (gpio_get_level(DEMO_JUMPER_GPIO) == 0) {
+        ESP_LOGI(TAG, "demo jumper is grounded: floor demo after countdown");
+        floor_test(10);
+    }
 
     setvbuf(stdin, NULL, _IONBF, 0);
     help();
