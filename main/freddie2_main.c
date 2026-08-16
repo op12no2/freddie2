@@ -158,73 +158,73 @@ static bool buzzer_stop(void)
     return i2c_master_transmit(buzzer_dev, cmd, sizeof cmd, 100) == ESP_OK;
 }
 
-/* ---------------------------------------------------------------- vocab */
+/* -------------------------------------------------------------- segments */
 
-/* Draft sound vocabulary: short square-wave phrases, R2-D2 school of
- * diction — rising = positive/asking, falling = negative/tired. */
+/* Everything the buzzer says is a sequence of segments. A segment glides
+ * pitch hz0->hz1 and volume vol0->vol1 over ms, in SEG_STEP_MS steps —
+ * a steady note is a glide that goes nowhere, a rest is hz0 == 0. On top
+ * of the glide: vib = periodic pitch wobble (% depth, SEG_VIB_HZ rate),
+ * trem = volume wobble (levels), jit = fresh random pitch scatter every
+ * step (%), the R2-D2 warble. All three stack. */
 
-#define VOCAB_VOL 4
+#define SEG_STEP_MS 20
+#define SEG_VIB_HZ  6
 
-typedef struct { uint16_t hz, ms, gap; } note_t;
+typedef struct {
+    uint16_t hz0, hz1;   /* pitch start -> end; 0 = rest */
+    uint8_t  vol0, vol1; /* volume start -> end (0-4) */
+    uint16_t ms;
+    uint8_t  vib;        /* vibrato depth, % of pitch */
+    uint8_t  trem;       /* tremolo depth, volume levels */
+    uint8_t  jit;        /* per-step random pitch scatter, % */
+} seg_t;
 
-static const note_t PH_HELLO[]    = { {1047,90,20},{1319,90,20},{1568,120,0} };
-static const note_t PH_YES[]      = { {1175,80,25},{1760,140,0} };
-static const note_t PH_NO[]       = { {494,120,30},{370,180,0} };
-static const note_t PH_QUESTION[] = { {880,100,30},{988,80,20},{1480,180,0} };
-static const note_t PH_HAPPY[]    = { {1047,70,15},{1319,70,15},{1568,70,15},
-                                      {2093,140,20},{1568,70,0} };
-static const note_t PH_SAD[]      = { {784,150,40},{659,150,40},{523,260,0} };
-static const note_t PH_ALERT[]    = { {2400,90,60},{2400,90,60},{2400,90,0} };
-static const note_t PH_TADA[]     = { {523,110,20},{659,110,20},{784,110,20},
-                                      {1047,320,0} };
+#define SEG(a, b, v0, v1, ms, vib, trem, jit) { a, b, v0, v1, ms, vib, trem, jit }
+#define NOTE(hz, vol, ms)          SEG(hz, hz, vol, vol, ms, 0, 0, 0)
+#define REST(ms)                   SEG(0, 0, 0, 0, ms, 0, 0, 0)
+#define GLIDE(a, b, vol, ms)       SEG(a, b, vol, vol, ms, 0, 0, 0)
+#define SWOOP(a, b, v0, v1, ms)    SEG(a, b, v0, v1, ms, 0, 0, 0)
+#define WARBLE(a, b, vol, ms, jit) SEG(a, b, vol, vol, ms, 0, 0, jit)
+#define VIB_NOTE(hz, vol, ms, d)   SEG(hz, hz, vol, vol, ms, d, 0, 0)
 
-#define PHRASE(name, notes) { name, notes, sizeof(notes) / sizeof(note_t) }
-static const struct { const char *name; const note_t *notes; int n; }
-PHRASES[] = {
-    PHRASE("hello",    PH_HELLO),
-    PHRASE("yes",      PH_YES),
-    PHRASE("no",       PH_NO),
-    PHRASE("question", PH_QUESTION),
-    PHRASE("happy",    PH_HAPPY),
-    PHRASE("sad",      PH_SAD),
-    PHRASE("alert",    PH_ALERT),
-    PHRASE("ta-da",    PH_TADA),
-};
-#define PHRASE_N ((int)(sizeof PHRASES / sizeof PHRASES[0]))
-
-/* Play one phrase; false if the buzzer is missing or a key aborted. */
-static bool phrase_play(int idx)
+static int rnd_range(int lo, int hi)
 {
-    printf("%d: %s\n", idx, PHRASES[idx].name);
-    for (int i = 0; i < PHRASES[idx].n; i++) {
-        const note_t *n = &PHRASES[idx].notes[i];
-        if (!buzzer_beep(n->hz, n->ms, VOCAB_VOL))
-            return false;
-        if (wait_or_key(n->ms + n->gap)) {
-            buzzer_stop();
-            return false;
-        }
-    }
-    return true;
+    return lo + esp_random() % (hi - lo + 1);
 }
 
-/* Glide: sweep between two frequencies in geometric steps ~20 ms apart
- * (pitch perception is logarithmic, so equal ratios sound like an even
- * slide). The buzzer runs continuously (duration 0) with the frequency
- * re-written each step — no per-note retrigger, so no gaps — and one
- * stop at the end. */
-static bool glide(int from_hz, int to_hz, int ms)
+/* Play one segment; false if the buzzer is missing or a key aborted. */
+static bool seg_play(const seg_t *s)
 {
+    if (s->hz0 == 0)
+        return !wait_or_key(s->ms);
     if (!buzzer_dev)
         return false;
-    int steps = ms / 20;
+
+    int steps = s->ms / SEG_STEP_MS;
     if (steps < 1) steps = 1;
-    float hz = from_hz;
-    float ratio = powf((float)to_hz / (float)from_hz, 1.0f / (float)steps);
+    float hz = s->hz0;
+    float ratio = powf((float)s->hz1 / (float)s->hz0, 1.0f / (float)steps);
+
     for (int i = 0; i <= steps; i++) {
-        if (!buzzer_beep((int)(hz + 0.5f), 0, VOCAB_VOL))
+        float f = hz;
+        if (s->vib)
+            f *= 1.0f + s->vib / 100.0f *
+                 sinf(6.2831853f * SEG_VIB_HZ * i * SEG_STEP_MS / 1000.0f);
+        if (s->jit)
+            f *= 1.0f + s->jit / 100.0f * (rnd_range(-1000, 1000) / 1000.0f);
+        if (f < 40) f = 40;
+        if (f > 10000) f = 10000;
+
+        float t = (float)i / (float)steps;
+        int vol = (int)(s->vol0 + (s->vol1 - (float)s->vol0) * t + 0.5f);
+        if (s->trem && ((i * SEG_STEP_MS * SEG_VIB_HZ * 2 / 1000) & 1))
+            vol -= s->trem;
+        if (vol < 0) vol = 0;
+        if (vol > 4) vol = 4;
+
+        if (!buzzer_beep((int)(f + 0.5f), 0, vol))
             return false;
-        if (wait_or_key(20)) {
+        if (wait_or_key(SEG_STEP_MS)) {
             buzzer_stop();
             return false;
         }
@@ -234,27 +234,84 @@ static bool glide(int from_hz, int to_hz, int ms)
     return true;
 }
 
-static int rnd_range(int lo, int hi)
+/* ---------------------------------------------------------------- vocab */
+
+/* Draft sound vocabulary, R2-D2 school of diction — rising = positive/
+ * asking, falling = negative/tired. All timings are draft; tuning them
+ * is an ongoing pastime. */
+
+static const seg_t PH_HELLO[]    = { NOTE(1047,4,90), REST(20),
+                                     NOTE(1319,4,90), REST(20),
+                                     NOTE(1568,4,120) };
+static const seg_t PH_YES[]      = { NOTE(1175,4,80), REST(25),
+                                     NOTE(1760,4,140) };
+static const seg_t PH_NO[]       = { NOTE(494,4,120), REST(30),
+                                     NOTE(370,4,180) };
+static const seg_t PH_QUESTION[] = { NOTE(880,4,100), REST(30),
+                                     NOTE(988,4,80), REST(20),
+                                     GLIDE(1200,1750,4,180) };
+static const seg_t PH_HAPPY[]    = { NOTE(1047,4,70), REST(15),
+                                     NOTE(1319,4,70), REST(15),
+                                     NOTE(1568,4,70), REST(15),
+                                     NOTE(2093,4,140), REST(20),
+                                     NOTE(1568,4,70) };
+static const seg_t PH_SAD[]      = { NOTE(784,4,150), REST(40),
+                                     NOTE(659,4,150), REST(40),
+                                     SWOOP(523,440,4,3,260) };
+static const seg_t PH_ALERT[]    = { NOTE(2400,4,90), REST(60),
+                                     NOTE(2400,4,90), REST(60),
+                                     NOTE(2400,4,90) };
+static const seg_t PH_TADA[]     = { NOTE(523,4,110), REST(20),
+                                     NOTE(659,4,110), REST(20),
+                                     NOTE(784,4,110), REST(20),
+                                     VIB_NOTE(1047,4,320,3) };
+static const seg_t PH_UHOH[]     = { GLIDE(650,550,4,140), REST(80),
+                                     SWOOP(480,360,4,3,220) };
+
+#define PHRASE(name, segs) { name, segs, sizeof(segs) / sizeof(seg_t) }
+static const struct { const char *name; const seg_t *segs; int n; }
+PHRASES[] = {
+    PHRASE("hello",    PH_HELLO),
+    PHRASE("yes",      PH_YES),
+    PHRASE("no",       PH_NO),
+    PHRASE("question", PH_QUESTION),
+    PHRASE("happy",    PH_HAPPY),
+    PHRASE("sad",      PH_SAD),
+    PHRASE("alert",    PH_ALERT),
+    PHRASE("ta-da",    PH_TADA),
+    PHRASE("uh-oh",    PH_UHOH),
+};
+#define PHRASE_N ((int)(sizeof PHRASES / sizeof PHRASES[0]))
+
+static bool phrase_play(int idx)
 {
-    return lo + esp_random() % (hi - lo + 1);
+    printf("%d: %s\n", idx, PHRASES[idx].name);
+    for (int i = 0; i < PHRASES[idx].n; i++)
+        if (!seg_play(&PHRASES[idx].segs[i]))
+            return false;
+    return true;
 }
 
-/* Random babble: random square-wave chirps for a while. Base frequency
- * is picked then shifted up 0-3 octaves so the spread sounds musical
- * rather than uniformly screechy (~200 Hz to ~3.2 kHz). */
+/* Random babble: a generator emitting random segments — mostly quick
+ * chirps (base pitch shifted up 0-3 octaves so the spread sounds musical,
+ * ~200 Hz to ~3.2 kHz), with the occasional short jittery swoop. */
 static void babble(int secs)
 {
     printf("babbling for %d s — any key stops.\n", secs);
     int64_t end = esp_timer_get_time() + (int64_t)secs * 1000000;
     while (esp_timer_get_time() < end) {
         int hz = rnd_range(200, 400) << rnd_range(0, 3);
-        int ms = rnd_range(40, 250);
-        if (!buzzer_beep(hz, ms, VOCAB_VOL))
-            return;
-        if (wait_or_key(ms + rnd_range(10, 130))) {
-            buzzer_stop();
-            return;
+        seg_t s;
+        if (esp_random() % 5 == 0) {
+            int hz2 = rnd_range(200, 400) << rnd_range(0, 3);
+            s = (seg_t)WARBLE(hz, hz2, 4, rnd_range(80, 180), 4);
+        } else {
+            s = (seg_t)NOTE(hz, 4, rnd_range(40, 250));
         }
+        if (!seg_play(&s))
+            return;
+        if (wait_or_key(rnd_range(10, 130)))
+            return;
     }
 }
 
@@ -445,6 +502,8 @@ static void help(void)
            PHRASE_N - 1);
     printf("  r [secs]              random babble (default 5 s)\n");
     printf("  g <hz1> <hz2> [ms]    glide between frequencies (default 300 ms)\n");
+    printf("  q <hz0> <hz1> [vol0] [vol1] [ms] [vib%%] [trem] [jit%%]\n");
+    printf("                        raw segment (hz0 0 = rest; defaults 4 4 200 0 0 0)\n");
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
     printf("  ?                     this help\n");
@@ -483,7 +542,30 @@ static void handle_line(const char *line)
         if (ms < 40) ms = 40;
         if (ms > 10000) ms = 10000;
         printf("glide %d -> %d Hz over %d ms\n", a, b, ms);
-        if (!glide(a, b, ms))
+        seg_t s = GLIDE(a, b, 4, ms);
+        if (!seg_play(&s))
+            printf("(no buzzer or aborted)\n");
+        break;
+    }
+    case 'q': {
+        seg_t s = { 0, 0, 4, 4, 200, 0, 0, 0 };
+        int hz0, hz1, v0 = 4, v1 = 4, ms = 200, vib = 0, trem = 0, jit = 0;
+        if (sscanf(line + 1, "%d %d %d %d %d %d %d %d",
+                   &hz0, &hz1, &v0, &v1, &ms, &vib, &trem, &jit) < 2) {
+            printf("usage: q <hz0> <hz1> [vol0] [vol1] [ms] [vib%%] [trem] [jit%%]\n");
+            break;
+        }
+        s.hz0 = hz0 < 0 ? 0 : (hz0 > 10000 ? 10000 : hz0);
+        s.hz1 = hz1 < 40 ? 40 : (hz1 > 10000 ? 10000 : hz1);
+        s.vol0 = v0 < 0 ? 0 : (v0 > 4 ? 4 : v0);
+        s.vol1 = v1 < 0 ? 0 : (v1 > 4 ? 4 : v1);
+        s.ms = ms < 20 ? 20 : (ms > 10000 ? 10000 : ms);
+        s.vib = vib < 0 ? 0 : (vib > 50 ? 50 : vib);
+        s.trem = trem < 0 ? 0 : (trem > 4 ? 4 : trem);
+        s.jit = jit < 0 ? 0 : (jit > 100 ? 100 : jit);
+        printf("seg %u->%u Hz vol %u->%u %u ms vib %u trem %u jit %u\n",
+               s.hz0, s.hz1, s.vol0, s.vol1, s.ms, s.vib, s.trem, s.jit);
+        if (!seg_play(&s))
             printf("(no buzzer or aborted)\n");
         break;
     }
