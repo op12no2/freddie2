@@ -15,6 +15,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "driver/uart.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -85,7 +86,7 @@ static i2c_master_bus_handle_t i2c_bus;  /* NULL if bus init failed */
 static void i2c_init(void)
 {
     i2c_master_bus_config_t cfg = {
-        .i2c_port = 0,   /* explicit: the camera's SCCB adopts this port */
+        .i2c_port = -1,
         .sda_io_num = I2C_SDA_GPIO,
         .scl_io_num = I2C_SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -156,51 +157,95 @@ static bool buzzer_stop(void)
     return i2c_master_transmit(buzzer_dev, cmd, sizeof cmd, 100) == ESP_OK;
 }
 
-/* ---------------------------------------------------------------- camera */
+/* -------------------------------------------------- ld2410 human radar */
 
-/* OV3660 on the board's DVP FPC connector. Data pins per the board
- * schematic page 3 (DVP_Y2..Y9 = camera driver d0..d7) — the wiki's
- * pin table has the low data bits scrambled; trust the schematic.
- * SCCB rides our existing I2C bus (port 0); XCLK is generated with
- * LEDC timer 1 / channel 4 so it can't collide with the motors on
- * timer 0 / channels 0-3. */
+/* Hi-Link LD2410C 24 GHz presence sensor on UART1 (256000 8N1). It
+ * streams a ~10 Hz binary report: header F4 F3 F2 F1, 2-byte length,
+ * payload, tail F8 F7 F6 F5. Normal-mode payload: type 0x02, 0xAA,
+ * state (bit0 moving, bit1 still), moving dist cm (LE16) + energy,
+ * still dist + energy, overall detect dist. */
 
-#include "esp_camera.h"
+#define LD_UART    UART_NUM_1
+#define LD_TX_GPIO 40   /* ESP TX -> sensor RX */
+#define LD_RX_GPIO 41   /* ESP RX <- sensor TX */
+#define LD_BAUD    256000
 
-static bool cam_ok;
+static bool ld_ok;  /* UART driver up (says nothing about wiring) */
 
-static void cam_init(void)
+typedef struct {
+    uint8_t state;
+    uint16_t mov_cm, still_cm, det_cm;
+    uint8_t mov_energy, still_energy;
+} ld_report_t;
+
+static void ld_init(void)
 {
-    camera_config_t cfg = {
-        .pin_pwdn = -1,
-        .pin_reset = -1,
-        .pin_xclk = 45,
-        .pin_sccb_sda = -1,          /* -1 = use sccb_i2c_port instead */
-        .pin_sccb_scl = -1,
-        .sccb_i2c_port = 0,
-        .pin_d7 = 48, .pin_d6 = 46, .pin_d5 = 8, .pin_d4 = 7,
-        .pin_d3 = 4, .pin_d2 = 41, .pin_d1 = 40, .pin_d0 = 39,
-        .pin_vsync = 6,
-        .pin_href = 42,
-        .pin_pclk = 5,
-        .xclk_freq_hz = 20000000,
-        .ledc_timer = LEDC_TIMER_1,
-        .ledc_channel = LEDC_CHANNEL_4,
-        .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_VGA,
-        .jpeg_quality = 12,
-        .fb_count = 2,
-        .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_LATEST,
+    uart_config_t cfg = {
+        .baud_rate = LD_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
     };
-    esp_err_t err = esp_camera_init(&cfg);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "camera not found (%s)", esp_err_to_name(err));
+    if (uart_driver_install(LD_UART, 2048, 0, 0, NULL, 0) != ESP_OK ||
+        uart_param_config(LD_UART, &cfg) != ESP_OK ||
+        uart_set_pin(LD_UART, LD_TX_GPIO, LD_RX_GPIO,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
+        ESP_LOGW(TAG, "ld2410 uart init failed");
         return;
     }
-    sensor_t *s = esp_camera_sensor_get();
-    ESP_LOGI(TAG, "camera found (sensor PID 0x%04x)", s ? s->id.PID : 0);
-    cam_ok = true;
+    ld_ok = true;
+    ESP_LOGI(TAG, "ld2410 uart ready (TX GPIO %d, RX GPIO %d)",
+             LD_TX_GPIO, LD_RX_GPIO);
+}
+
+/* Scan the UART stream for one well-formed normal-mode report. */
+static bool ld_read(ld_report_t *out, int wait_ms)
+{
+    if (!ld_ok)
+        return false;
+    static const uint8_t HDR[4] = { 0xF4, 0xF3, 0xF2, 0xF1 };
+    static const uint8_t TAIL[4] = { 0xF8, 0xF7, 0xF6, 0xF5 };
+    int64_t end = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+    int match = 0, len = 0, got = -2;  /* got < 0: reading length bytes */
+    uint8_t payload[32];
+
+    while (esp_timer_get_time() < end) {
+        uint8_t b;
+        if (uart_read_bytes(LD_UART, &b, 1, pdMS_TO_TICKS(20)) != 1)
+            continue;
+        if (match < 4) {                       /* hunting for header */
+            match = (b == HDR[match]) ? match + 1 : (b == HDR[0] ? 1 : 0);
+            len = 0;
+            got = -2;
+        } else if (got < 0) {                  /* two length bytes, LE */
+            len |= b << (8 * (2 + got));
+            if (++got == 0 && (len < 11 || len > (int)sizeof(payload))) {
+                match = 0;                     /* not a normal report */
+            }
+        } else if (got < len) {                /* payload */
+            payload[got++] = b;
+        } else {                               /* four tail bytes */
+            if (b != TAIL[got - len]) {
+                match = 0;
+                continue;
+            }
+            if (++got - len == 4) {
+                match = 0;
+                if (payload[0] != 0x02 || payload[1] != 0xAA)
+                    continue;                  /* engineering-mode etc. */
+                out->state = payload[2];
+                out->mov_cm = payload[3] | payload[4] << 8;
+                out->mov_energy = payload[5];
+                out->still_cm = payload[6] | payload[7] << 8;
+                out->still_energy = payload[8];
+                out->det_cm = payload[9] | payload[10] << 8;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* -------------------------------------------------------------- segments */
@@ -559,9 +604,7 @@ static void help(void)
     printf("                        raw segment (hz0 0 = rest; defaults 4 4 200 0 0 0)\n");
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
-    printf("  c                     grab a camera frame, report size/timing\n");
-    printf("  j                     dump a camera frame as base64 jpeg\n");
-    printf("                        (tools/grab_frame.py fetches + decodes it)\n");
+    printf("  h                     stream human-radar readings until a key\n");
     printf("  ?                     this help\n");
     printf("[secs] defaults to %d; 0 = run until `s`.\n", RUN_DEFAULT_S);
 }
@@ -603,55 +646,27 @@ static void handle_line(const char *line)
             printf("(no buzzer or aborted)\n");
         break;
     }
-    case 'c': {
-        if (!cam_ok) {
-            printf("no camera.\n");
-            break;
+    case 'h': {
+        printf("human radar — any key stops.\n");
+        uart_flush_input(LD_UART);
+        bool seen = false;
+        while (key_poll() == EOF) {
+            ld_report_t r;
+            if (!ld_read(&r, 500)) {
+                if (!seen) {
+                    printf("no data — check wiring/power.\n");
+                    break;
+                }
+                continue;
+            }
+            seen = true;
+            static const char *STATES[] =
+                { "nobody", "moving", "still", "moving+still" };
+            printf("%-12s det %3u cm | move %3u cm e%-3u | still %3u cm e%-3u\n",
+                   STATES[r.state & 3], r.det_cm,
+                   r.mov_cm, r.mov_energy, r.still_cm, r.still_energy);
+            wait_or_key(250);
         }
-        int64_t t0 = esp_timer_get_time();
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            printf("capture failed.\n");
-            break;
-        }
-        printf("frame: %ux%u, %u bytes jpeg, %lld ms\n",
-               fb->width, fb->height, (unsigned)fb->len,
-               (esp_timer_get_time() - t0) / 1000);
-        esp_camera_fb_return(fb);
-        break;
-    }
-    case 'j': {
-        if (!cam_ok) {
-            printf("no camera.\n");
-            break;
-        }
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            printf("capture failed.\n");
-            break;
-        }
-        /* Base64 between markers, 76-char lines — tools/grab_frame.py
-         * on the host turns this into a .jpg. */
-        static const char B64[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        printf("JPEG-BEGIN %u\n", (unsigned)fb->len);
-        const uint8_t *p = fb->buf;
-        for (size_t i = 0; i < fb->len; i += 3) {
-            uint32_t v = (uint32_t)p[i] << 16 |
-                         (i + 1 < fb->len ? p[i + 1] : 0) << 8 |
-                         (i + 2 < fb->len ? p[i + 2] : 0);
-            char quad[5] = {
-                B64[v >> 18], B64[(v >> 12) & 63],
-                i + 1 < fb->len ? B64[(v >> 6) & 63] : '=',
-                i + 2 < fb->len ? B64[v & 63] : '=',
-                0,
-            };
-            fputs(quad, stdout);
-            if ((i / 3 + 1) % 19 == 0)
-                putchar('\n');
-        }
-        printf("\nJPEG-END\n");
-        esp_camera_fb_return(fb);
         break;
     }
     case 'q': {
@@ -774,7 +789,7 @@ void app_main(void)
 
     i2c_init();
     buzzer_init();
-    cam_init();
+    ld_init();
 
     setvbuf(stdin, NULL, _IONBF, 0);
     help();

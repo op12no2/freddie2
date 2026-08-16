@@ -101,18 +101,20 @@ like a dead motor channel — check them before debugging firmware.
 at 0x34 (ATtiny register map — freq/volume/duration/active registers,
 probed at boot, `b` console command beeps it).
 
-**OV3660 camera** on the DVP FPC connector, driven by the
-`espressif/esp32-camera` managed component (declared in
-`main/idf_component.yml`; `managed_components/` is generated and
-gitignored). SCCB shares I2C port 0 with the buzzer; XCLK uses LEDC
-timer 1/channel 4 (motors own timer 0, channels 0–3). The camera claims
-GPIOs 4–8, 39–42, 45, 46, 48, so those are off-limits to other uses.
-`c` grabs a frame and reports size and timing. Data-pin order comes
-from the schematic, not the wiki — the wiki's camera pin table is wrong.
+**LD2410C human presence radar** (verified with the `h` console command):
+UART1 at 256000 8N1 — ESP TX = GPIO 40 → sensor RX, ESP RX = GPIO 41 ←
+sensor TX, powered from the 5 V servo rail (logic is 3.3 V despite the
+5 V supply). Streams ~10 Hz binary reports (presence state, moving/still
+target distance + energy); `h` streams them to the console. Indoors the
+still-target energy is pegged at 100 at close range — behavior code
+should key off state/distance changes and moving energy, and the sensor's
+per-gate sensitivities are configurable over UART or via Hi-Link's BLE
+phone app when tuning is needed.
 
-(An LD2410C presence radar was briefly wired and verified on UART1,
-GPIO 43/44, before moving to another project; the parser is in git
-history, commit 86bae3d, if ever wanted again.)
+(An OV3660 camera on the DVP connector was briefly brought up — frame
+capture verified, then removed in favour of the radar. The working code,
+including the schematic-correct data-pin order the wiki gets wrong, is
+in git history at commit a3c5883 if vision is ever revisited.)
 
 ## Repo layout
 
