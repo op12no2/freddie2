@@ -15,6 +15,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "driver/uart.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
@@ -156,6 +157,97 @@ static bool buzzer_stop(void)
         return false;
     uint8_t cmd[2] = { BUZZER_REG_ACTIVE, 0 };
     return i2c_master_transmit(buzzer_dev, cmd, sizeof cmd, 100) == ESP_OK;
+}
+
+/* -------------------------------------------------- ld2410 human radar */
+
+/* Hi-Link LD2410C 24 GHz presence sensor on UART1 (256000 8N1). It
+ * streams a ~10 Hz binary report: header F4 F3 F2 F1, 2-byte length,
+ * payload, tail F8 F7 F6 F5. Normal-mode payload: type 0x02, 0xAA,
+ * state (bit0 moving, bit1 still), moving dist cm (LE16) + energy,
+ * still dist + energy, overall detect dist. */
+
+#define LD_UART    UART_NUM_1
+#define LD_TX_GPIO 40   /* ESP TX -> sensor RX */
+#define LD_RX_GPIO 41   /* ESP RX <- sensor TX */
+#define LD_BAUD    256000
+
+static bool ld_ok;  /* UART driver up (says nothing about wiring) */
+
+typedef struct {
+    uint8_t state;
+    uint16_t mov_cm, still_cm, det_cm;
+    uint8_t mov_energy, still_energy;
+} ld_report_t;
+
+static void ld_init(void)
+{
+    uart_config_t cfg = {
+        .baud_rate = LD_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(LD_UART, 2048, 0, 0, NULL, 0) != ESP_OK ||
+        uart_param_config(LD_UART, &cfg) != ESP_OK ||
+        uart_set_pin(LD_UART, LD_TX_GPIO, LD_RX_GPIO,
+                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
+        ESP_LOGW(TAG, "ld2410 uart init failed");
+        return;
+    }
+    ld_ok = true;
+    ESP_LOGI(TAG, "ld2410 uart ready (TX GPIO %d, RX GPIO %d)",
+             LD_TX_GPIO, LD_RX_GPIO);
+}
+
+/* Scan the UART stream for one well-formed normal-mode report. */
+static bool ld_read(ld_report_t *out, int wait_ms)
+{
+    if (!ld_ok)
+        return false;
+    static const uint8_t HDR[4] = { 0xF4, 0xF3, 0xF2, 0xF1 };
+    static const uint8_t TAIL[4] = { 0xF8, 0xF7, 0xF6, 0xF5 };
+    int64_t end = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+    int match = 0, len = 0, got = -2;  /* got < 0: reading length bytes */
+    uint8_t payload[32];
+
+    while (esp_timer_get_time() < end) {
+        uint8_t b;
+        if (uart_read_bytes(LD_UART, &b, 1, pdMS_TO_TICKS(20)) != 1)
+            continue;
+        if (match < 4) {                       /* hunting for header */
+            match = (b == HDR[match]) ? match + 1 : (b == HDR[0] ? 1 : 0);
+            len = 0;
+            got = -2;
+        } else if (got < 0) {                  /* two length bytes, LE */
+            len |= b << (8 * (2 + got));
+            if (++got == 0 && (len < 11 || len > (int)sizeof(payload))) {
+                match = 0;                     /* not a normal report */
+            }
+        } else if (got < len) {                /* payload */
+            payload[got++] = b;
+        } else {                               /* four tail bytes */
+            if (b != TAIL[got - len]) {
+                match = 0;
+                continue;
+            }
+            if (++got - len == 4) {
+                match = 0;
+                if (payload[0] != 0x02 || payload[1] != 0xAA)
+                    continue;                  /* engineering-mode etc. */
+                out->state = payload[2];
+                out->mov_cm = payload[3] | payload[4] << 8;
+                out->mov_energy = payload[5];
+                out->still_cm = payload[6] | payload[7] << 8;
+                out->still_energy = payload[8];
+                out->det_cm = payload[9] | payload[10] << 8;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /* -------------------------------------------------------------- segments */
@@ -514,6 +606,7 @@ static void help(void)
     printf("                        raw segment (hz0 0 = rest; defaults 4 4 200 0 0 0)\n");
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
+    printf("  h                     stream human-radar readings until a key\n");
     printf("  ?                     this help\n");
     printf("[secs] defaults to %d; 0 = run until `s`.\n", RUN_DEFAULT_S);
 }
@@ -553,6 +646,29 @@ static void handle_line(const char *line)
         seg_t s = GLIDE(a, b, 4, ms);
         if (!seg_play(&s))
             printf("(no buzzer or aborted)\n");
+        break;
+    }
+    case 'h': {
+        printf("human radar — any key stops.\n");
+        uart_flush_input(LD_UART);
+        bool seen = false;
+        while (key_poll() == EOF) {
+            ld_report_t r;
+            if (!ld_read(&r, 500)) {
+                if (!seen) {
+                    printf("no data — check wiring/power.\n");
+                    break;
+                }
+                continue;
+            }
+            seen = true;
+            static const char *STATES[] =
+                { "nobody", "moving", "still", "moving+still" };
+            printf("%-12s det %3u cm | move %3u cm e%-3u | still %3u cm e%-3u\n",
+                   STATES[r.state & 3], r.det_cm,
+                   r.mov_cm, r.mov_energy, r.still_cm, r.still_energy);
+            wait_or_key(250);
+        }
         break;
     }
     case 'q': {
@@ -675,6 +791,7 @@ void app_main(void)
 
     i2c_init();
     buzzer_init();
+    ld_init();
     if (buzzer_dev) {
         //vocab_run_through();
         babble(2);

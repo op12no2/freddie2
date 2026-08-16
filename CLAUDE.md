@@ -99,9 +99,17 @@ like a dead motor channel — check them before debugging firmware.
 
 **I2C**: GPIO 1 (SDA), GPIO 2 (SCL). On the bus: SparkFun Qwiic Buzzer
 at 0x34 (ATtiny register map — freq/volume/duration/active registers,
-probed at boot, `b` console command beeps it). Still to come:
-serial-attached Hi-Link LD2410C 24 GHz human presence sensor (UART, not
-I2C — pin assignment TBD).
+probed at boot, `b` console command beeps it).
+
+**LD2410C human presence radar** (verified with the `h` console command):
+UART1 at 256000 8N1 — ESP TX = GPIO 40 → sensor RX, ESP RX = GPIO 41 ←
+sensor TX, powered from the 5 V servo rail (logic is 3.3 V despite the
+5 V supply). Streams ~10 Hz binary reports (presence state, moving/still
+target distance + energy); `h` streams them to the console. Indoors the
+still-target energy is pegged at 100 at close range — behavior code
+should key off state/distance changes and moving energy, and the sensor's
+per-gate sensitivities are configurable over UART or via Hi-Link's BLE
+phone app when tuning is needed.
 
 ## Repo layout
 
