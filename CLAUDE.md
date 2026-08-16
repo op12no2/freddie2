@@ -10,19 +10,37 @@ Romeo ESP32-S3, DFR0994) instead of hand-wired modules, and a mecanum-wheel
 chassis (Waveshare Robot Chassis Kit MS) with four independently driven
 wheels, so the robot can translate in any direction as well as rotate.
 
-The firmware (`main/freddie2_main.c`) is currently a motor bench-test
-console: chip info at boot, then single-letter commands over the USB-C
-console (`?` prints the list — `t` runs each motor in turn to identify
-wheel wiring, `m`/`a`/`d` drive motors with an auto-stop timeout,
-`s` stops). Behavioral code will grow from here, likely following
-Freddie 1's single-file, single-tick-task style — see
-`../freddie/CLAUDE.md` for how that firmware was structured.
+The firmware (`main/freddie2_main.c`) is currently a bench-test console:
+chip info at boot, peripheral init, then single-letter commands over the
+USB-C console (`?` prints the list). All hardware is wired and verified:
+motors (`t` wheel test, `m`/`a`/`d` drive, `x` floor demo, `s` stop),
+Qwiic buzzer (`b` beep, `p` vocab phrases, `r` babble, `g` glide, `q`
+raw sound segment), and the LD2410C radar (`h` live stream). Boot is
+deliberately quiet — no sounds or motion until commanded.
+
+The next chapter is behavioral code: a Freddie 1-style single tick task
+and a watcher that reacts to the radar (someone arriving/approaching/
+leaving) with sounds and motion — see `../freddie/CLAUDE.md` for how
+that firmware was structured. Two hard-won lessons for it: (1) any
+consumer reading the radar slower than its ~10 Hz stream must drain the
+UART backlog and take the latest frame, or it reacts to seconds-old
+data; (2) sounds are `seg_t` sequences played by `seg_play()` — phrases
+are data tables, and the babble generator shows how to synthesize them.
 
 Motor commands default to a 3 s auto-stop so a forgotten command can't
 drive the robot off the bench; keep that property as the code grows.
 The DRV8876s are driven in PH/EN mode: EN pin = LEDC PWM at 20 kHz,
-PH pin = direction. The wheel-position mapping macros (`FL_CH`/`FL_POL`
-etc.) are placeholders until verified with `t` on the wired chassis.
+PH pin = direction. Sound-vocabulary tuning is treated as an ongoing
+pastime of the project owner — expect hand-edits to the `PH_*` tables.
+
+On order: a Fermion 1.54" 240x240 IPS TFT (DFR0649, ST7789) for the
+GDI FPC connector, which also brings a microSD slot over the same
+ribbon (GDI_SDCS = IO0, SPI on IO15/16/17 — note the Romeo's onboard
+SD socket shares these same lines and CS, so only one slot may hold a
+card at a time). GDI quirk from the schematic: GDI_BLK (backlight) is
+IO21 = M2's direction pin, so the backlight will flick with the
+front-right wheel's direction — cosmetic, accepted; GDI touch lines
+collide with M1's pins, so touch screens are out (this one isn't).
 
 There is no test suite — this is embedded C for one physical device.
 Correctness is checked by flashing and watching the serial console.
