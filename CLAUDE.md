@@ -97,9 +97,11 @@ mode) and per-channel EN/PH jumpers (e.g. M1EN/M1PH) that connect the
 ESP32 GPIOs to the driver inputs. A popped EN/PH jumper looks exactly
 like a dead motor channel — check them before debugging firmware.
 
-**I2C**: GPIO 1 (SDA), GPIO 2 (SCL). Planned peripherals on this bus:
-SparkFun Qwiic Buzzer, and serial-attached Hi-Link LD2410C 24 GHz human
-presence sensor (UART, not I2C — pin assignment TBD).
+**I2C**: GPIO 1 (SDA), GPIO 2 (SCL). On the bus: SparkFun Qwiic Buzzer
+at 0x34 (ATtiny register map — freq/volume/duration/active registers,
+probed at boot, `b` console command beeps it). Still to come:
+serial-attached Hi-Link LD2410C 24 GHz human presence sensor (UART, not
+I2C — pin assignment TBD).
 
 ## Repo layout
 

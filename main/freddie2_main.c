@@ -12,11 +12,13 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -53,6 +55,191 @@ static const struct { int en, ph; } MOTOR_GPIO[MOTOR_N] = {
 #define RUN_DEFAULT_S 3   /* auto-stop delay when a command gives no duration */
 
 #define DEMO_JUMPER_GPIO 48   /* grounded at boot = run the floor demo */
+
+/* Non-blocking poll of stdin; EOF (nothing waiting) clears the error flag
+ * so later reads still work. */
+static int key_poll(void)
+{
+    int c = fgetc(stdin);
+    if (c == EOF) clearerr(stdin);
+    return c;
+}
+
+/* Delay in small slices, bailing out early if a key arrives. */
+static bool wait_or_key(int ms)
+{
+    for (int t = 0; t < ms; t += 50) {
+        if (key_poll() != EOF) return true;
+        int slice = (ms - t < 50) ? ms - t : 50;
+        vTaskDelay(pdMS_TO_TICKS(slice));
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------ i2c */
+
+#define I2C_SDA_GPIO 1
+#define I2C_SCL_GPIO 2
+
+static i2c_master_bus_handle_t i2c_bus;  /* NULL if bus init failed */
+
+static void i2c_init(void)
+{
+    i2c_master_bus_config_t cfg = {
+        .i2c_port = -1,
+        .sda_io_num = I2C_SDA_GPIO,
+        .scl_io_num = I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    esp_err_t err = i2c_new_master_bus(&cfg, &i2c_bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "i2c bus init failed: %s", esp_err_to_name(err));
+        i2c_bus = NULL;
+    }
+}
+
+/* --------------------------------------------------------------- buzzer */
+
+/* SparkFun Qwiic Buzzer: ATtiny with a register map. Registers 0x03..0x08
+ * are freq MSB/LSB (Hz), volume (0-4), duration MSB/LSB (ms, 0 = until
+ * stopped), active (1 = sound). Written as one sequential block. */
+#define BUZZER_ADDR         0x34
+#define BUZZER_REG_ID       0x00
+#define BUZZER_ID           0x5E
+#define BUZZER_REG_FREQ_MSB 0x03
+#define BUZZER_REG_ACTIVE   0x08
+#define BUZZER_DEFAULT_HZ   2730   /* the piezo's resonant frequency */
+
+static i2c_master_dev_handle_t buzzer_dev;  /* NULL = not found at boot */
+
+static void buzzer_init(void)
+{
+    if (!i2c_bus || i2c_master_probe(i2c_bus, BUZZER_ADDR, 100) != ESP_OK) {
+        ESP_LOGW(TAG, "buzzer not found on i2c (0x%02X)", BUZZER_ADDR);
+        return;
+    }
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BUZZER_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    if (i2c_master_bus_add_device(i2c_bus, &cfg, &buzzer_dev) != ESP_OK) {
+        buzzer_dev = NULL;
+        return;
+    }
+    uint8_t reg = BUZZER_REG_ID, id = 0;
+    i2c_master_transmit_receive(buzzer_dev, &reg, 1, &id, 1, 100);
+    ESP_LOGI(TAG, "buzzer found at 0x%02X (id 0x%02X%s)", BUZZER_ADDR, id,
+             id == BUZZER_ID ? ", ok" : " — unexpected!");
+}
+
+static bool buzzer_beep(int hz, int ms, int vol)
+{
+    if (!buzzer_dev)
+        return false;
+    uint8_t cmd[7] = {
+        BUZZER_REG_FREQ_MSB,
+        hz >> 8, hz & 0xff,
+        vol,
+        ms >> 8, ms & 0xff,
+        1,
+    };
+    return i2c_master_transmit(buzzer_dev, cmd, sizeof cmd, 100) == ESP_OK;
+}
+
+static bool buzzer_stop(void)
+{
+    if (!buzzer_dev)
+        return false;
+    uint8_t cmd[2] = { BUZZER_REG_ACTIVE, 0 };
+    return i2c_master_transmit(buzzer_dev, cmd, sizeof cmd, 100) == ESP_OK;
+}
+
+/* ---------------------------------------------------------------- vocab */
+
+/* Draft sound vocabulary: short square-wave phrases, R2-D2 school of
+ * diction — rising = positive/asking, falling = negative/tired. */
+
+#define VOCAB_VOL 4
+
+typedef struct { uint16_t hz, ms, gap; } note_t;
+
+static const note_t PH_HELLO[]    = { {1047,90,20},{1319,90,20},{1568,120,0} };
+static const note_t PH_YES[]      = { {1175,80,25},{1760,140,0} };
+static const note_t PH_NO[]       = { {494,120,30},{370,180,0} };
+static const note_t PH_QUESTION[] = { {880,100,30},{988,80,20},{1480,180,0} };
+static const note_t PH_HAPPY[]    = { {1047,70,15},{1319,70,15},{1568,70,15},
+                                      {2093,140,20},{1568,70,0} };
+static const note_t PH_SAD[]      = { {784,150,40},{659,150,40},{523,260,0} };
+static const note_t PH_ALERT[]    = { {2400,90,60},{2400,90,60},{2400,90,0} };
+static const note_t PH_TADA[]     = { {523,110,20},{659,110,20},{784,110,20},
+                                      {1047,320,0} };
+
+#define PHRASE(name, notes) { name, notes, sizeof(notes) / sizeof(note_t) }
+static const struct { const char *name; const note_t *notes; int n; }
+PHRASES[] = {
+    PHRASE("hello",    PH_HELLO),
+    PHRASE("yes",      PH_YES),
+    PHRASE("no",       PH_NO),
+    PHRASE("question", PH_QUESTION),
+    PHRASE("happy",    PH_HAPPY),
+    PHRASE("sad",      PH_SAD),
+    PHRASE("alert",    PH_ALERT),
+    PHRASE("ta-da",    PH_TADA),
+};
+#define PHRASE_N ((int)(sizeof PHRASES / sizeof PHRASES[0]))
+
+/* Play one phrase; false if the buzzer is missing or a key aborted. */
+static bool phrase_play(int idx)
+{
+    printf("%d: %s\n", idx, PHRASES[idx].name);
+    for (int i = 0; i < PHRASES[idx].n; i++) {
+        const note_t *n = &PHRASES[idx].notes[i];
+        if (!buzzer_beep(n->hz, n->ms, VOCAB_VOL))
+            return false;
+        if (wait_or_key(n->ms + n->gap)) {
+            buzzer_stop();
+            return false;
+        }
+    }
+    return true;
+}
+
+static int rnd_range(int lo, int hi)
+{
+    return lo + esp_random() % (hi - lo + 1);
+}
+
+/* Random babble: random square-wave chirps for a while. Base frequency
+ * is picked then shifted up 0-3 octaves so the spread sounds musical
+ * rather than uniformly screechy (~200 Hz to ~3.2 kHz). */
+static void babble(int secs)
+{
+    printf("babbling for %d s — any key stops.\n", secs);
+    int64_t end = esp_timer_get_time() + (int64_t)secs * 1000000;
+    while (esp_timer_get_time() < end) {
+        int hz = rnd_range(200, 400) << rnd_range(0, 3);
+        int ms = rnd_range(40, 250);
+        if (!buzzer_beep(hz, ms, VOCAB_VOL))
+            return;
+        if (wait_or_key(ms + rnd_range(10, 130))) {
+            buzzer_stop();
+            return;
+        }
+    }
+}
+
+static void vocab_run_through(void)
+{
+    for (int i = 0; i < PHRASE_N; i++) {
+        if (!phrase_play(i))
+            return;
+        if (wait_or_key(350))
+            return;
+    }
+}
 
 static int motor_pct[MOTOR_N];    /* last commanded values, for `v` */
 static int64_t motor_stop_at_us;  /* 0 = no auto-stop pending */
@@ -142,25 +329,6 @@ static void drive(int x, int y, int r)
 
 /* --------------------------------------------------------------- console */
 
-/* Non-blocking poll of stdin; EOF (nothing waiting) clears the error flag
- * so later reads still work. */
-static int key_poll(void)
-{
-    int c = fgetc(stdin);
-    if (c == EOF) clearerr(stdin);
-    return c;
-}
-
-/* Delay in small slices, bailing out early if a key arrives. */
-static bool wait_or_key(int ms)
-{
-    for (int t = 0; t < ms; t += 50) {
-        if (key_poll() != EOF) return true;
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-    return false;
-}
-
 /* Wheel-mapping test: each channel in turn, forward then reverse, so the
  * FL/FR/RL/RR macros can be corrected to match the real wiring. Any key
  * aborts. */
@@ -243,6 +411,12 @@ static void help(void)
     printf("  m <1-4> <pct> [secs]  one motor, pct -100..100\n");
     printf("  a <pct> [secs]        all motors\n");
     printf("  d <x> <y> <r> [secs]  mecanum drive: x strafe, y fwd, r rotate\n");
+    printf("  b [hz] [ms] [vol]     beep (defaults %d Hz, 300 ms, vol 4;\n",
+           BUZZER_DEFAULT_HZ);
+    printf("                        ms 0 = continuous, `b 0` stops)\n");
+    printf("  p [n]                 play vocab phrase n (0-%d), or all\n",
+           PHRASE_N - 1);
+    printf("  r [secs]              random babble (default 5 s)\n");
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
     printf("  ?                     this help\n");
@@ -268,6 +442,45 @@ static void handle_line(const char *line)
     case 't':
         test_wheels();
         break;
+    case 'r':
+        a = 5;
+        sscanf(line + 1, "%d", &a);
+        if (a < 1) a = 1;
+        if (a > 60) a = 60;
+        babble(a);
+        break;
+    case 'p':
+        if (sscanf(line + 1, "%d", &a) == 1) {
+            if (a < 0 || a >= PHRASE_N) {
+                printf("phrases are 0-%d\n", PHRASE_N - 1);
+                break;
+            }
+            if (!phrase_play(a))
+                printf("(no buzzer or aborted)\n");
+        } else {
+            vocab_run_through();
+        }
+        break;
+    case 'b': {
+        int hz = BUZZER_DEFAULT_HZ, ms = 300, vol = 4;
+        sscanf(line + 1, "%d %d %d", &hz, &ms, &vol);
+        if (hz < 0) hz = 0;
+        if (hz > 0xffff) hz = 0xffff;
+        if (ms < 0) ms = 0;
+        if (ms > 0xffff) ms = 0xffff;
+        if (vol < 0) vol = 0;
+        if (vol > 4) vol = 4;
+        bool ok;
+        if (hz == 0) {
+            ok = buzzer_stop();
+            printf(ok ? "buzzer stopped.\n" : "no buzzer.\n");
+        } else {
+            ok = buzzer_beep(hz, ms, vol);
+            printf(ok ? "beep: %d Hz, %d ms, vol %d\n" : "no buzzer.\n",
+                   hz, ms, vol);
+        }
+        break;
+    }
     case 'x':
         a = 5;
         sscanf(line + 1, "%d", &a);
@@ -324,6 +537,11 @@ void app_main(void)
 
     motors_init();
     ESP_LOGI(TAG, "motors ready (VM must be powered for wheels to turn)");
+
+    i2c_init();
+    buzzer_init();
+    if (buzzer_dev)
+        babble(10);
 
     /* Demo-on-boot jumper: if GPIO 48 (header P18, internal pull-up) is
      * patched to GND at power-on, run the floor demo after a countdown.
