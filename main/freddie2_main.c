@@ -648,10 +648,13 @@ static void handle_line(const char *line)
     }
     case 'h': {
         printf("human radar — any key stops.\n");
-        uart_flush_input(LD_UART);
         bool seen = false;
         while (key_poll() == EOF) {
             ld_report_t r;
+            /* The sensor streams ~10 reports/s but we display ~4/s;
+             * drop the backlog each pass or the readout lags reality
+             * by however much the UART ring buffer holds (~10 s). */
+            uart_flush_input(LD_UART);
             if (!ld_read(&r, 500)) {
                 if (!seen) {
                     printf("no data — check wiring/power.\n");
