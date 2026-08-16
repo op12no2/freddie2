@@ -585,8 +585,14 @@ void app_main(void)
 
     i2c_init();
     buzzer_init();
-    if (buzzer_dev)
-        babble(10);
+    if (buzzer_dev) {
+        //vocab_run_through();
+        babble(2);
+        wait_or_key(500);
+        babble(3);
+        wait_or_key(600);
+        babble(1);
+    }    
 
     /* Demo-on-boot jumper: if GPIO 48 (header P18, internal pull-up) is
      * patched to GND at power-on, run the floor demo after a countdown.
@@ -600,7 +606,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(50));
     if (gpio_get_level(DEMO_JUMPER_GPIO) == 0) {
         ESP_LOGI(TAG, "demo jumper is grounded: floor demo after countdown");
-        floor_test(10);
+        floor_test(1);
     }
 
     setvbuf(stdin, NULL, _IONBF, 0);
