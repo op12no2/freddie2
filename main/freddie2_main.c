@@ -8,6 +8,7 @@
  */
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -204,6 +205,32 @@ static bool phrase_play(int idx)
             return false;
         }
     }
+    return true;
+}
+
+/* Glide: sweep between two frequencies in geometric steps ~20 ms apart
+ * (pitch perception is logarithmic, so equal ratios sound like an even
+ * slide). The buzzer runs continuously (duration 0) with the frequency
+ * re-written each step — no per-note retrigger, so no gaps — and one
+ * stop at the end. */
+static bool glide(int from_hz, int to_hz, int ms)
+{
+    if (!buzzer_dev)
+        return false;
+    int steps = ms / 20;
+    if (steps < 1) steps = 1;
+    float hz = from_hz;
+    float ratio = powf((float)to_hz / (float)from_hz, 1.0f / (float)steps);
+    for (int i = 0; i <= steps; i++) {
+        if (!buzzer_beep((int)(hz + 0.5f), 0, VOCAB_VOL))
+            return false;
+        if (wait_or_key(20)) {
+            buzzer_stop();
+            return false;
+        }
+        hz *= ratio;
+    }
+    buzzer_stop();
     return true;
 }
 
@@ -417,6 +444,7 @@ static void help(void)
     printf("  p [n]                 play vocab phrase n (0-%d), or all\n",
            PHRASE_N - 1);
     printf("  r [secs]              random babble (default 5 s)\n");
+    printf("  g <hz1> <hz2> [ms]    glide between frequencies (default 300 ms)\n");
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
     printf("  ?                     this help\n");
@@ -442,6 +470,23 @@ static void handle_line(const char *line)
     case 't':
         test_wheels();
         break;
+    case 'g': {
+        int ms = 300;
+        if (sscanf(line + 1, "%d %d %d", &a, &b, &ms) < 2) {
+            printf("usage: g <from_hz> <to_hz> [ms]\n");
+            break;
+        }
+        if (a < 40) a = 40;
+        if (a > 10000) a = 10000;
+        if (b < 40) b = 40;
+        if (b > 10000) b = 10000;
+        if (ms < 40) ms = 40;
+        if (ms > 10000) ms = 10000;
+        printf("glide %d -> %d Hz over %d ms\n", a, b, ms);
+        if (!glide(a, b, ms))
+            printf("(no buzzer or aborted)\n");
+        break;
+    }
     case 'r':
         a = 5;
         sscanf(line + 1, "%d", &a);
