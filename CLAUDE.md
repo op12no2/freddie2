@@ -33,15 +33,6 @@ The DRV8876s are driven in PH/EN mode: EN pin = LEDC PWM at 20 kHz,
 PH pin = direction. Sound-vocabulary tuning is treated as an ongoing
 pastime of the project owner — expect hand-edits to the `PH_*` tables.
 
-On order: a Fermion 1.54" 240x240 IPS TFT (DFR0649, ST7789) for the
-GDI FPC connector, which also brings a microSD slot over the same
-ribbon (GDI_SDCS = IO0, SPI on IO15/16/17 — note the Romeo's onboard
-SD socket shares these same lines and CS, so only one slot may hold a
-card at a time). GDI quirk from the schematic: GDI_BLK (backlight) is
-IO21 = M2's direction pin, so the backlight will flick with the
-front-right wheel's direction — cosmetic, accepted; GDI touch lines
-collide with M1's pins, so touch screens are out (this one isn't).
-
 There is no test suite — this is embedded C for one physical device.
 Correctness is checked by flashing and watching the serial console.
 
@@ -128,11 +119,6 @@ still-target energy is pegged at 100 at close range — behavior code
 should key off state/distance changes and moving energy, and the sensor's
 per-gate sensitivities are configurable over UART or via Hi-Link's BLE
 phone app when tuning is needed.
-
-(An OV3660 camera on the DVP connector was briefly brought up — frame
-capture verified, then removed in favour of the radar. The working code,
-including the schematic-correct data-pin order the wiki gets wrong, is
-in git history at commit a3c5883 if vision is ever revisited.)
 
 ## Repo layout
 
