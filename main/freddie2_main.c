@@ -265,8 +265,12 @@ static const seg_t PH_TADA[]     = { NOTE(523,4,110), REST(20),
                                      NOTE(659,4,110), REST(20),
                                      NOTE(784,4,110), REST(20),
                                      VIB_NOTE(1047,4,320,3) };
-static const seg_t PH_UHOH[]     = { GLIDE(650,550,4,140), REST(80),
-                                     SWOOP(480,360,4,3,220) };
+static const seg_t PH_UHOH[]     = { NOTE(587,4,200), REST(80),
+                                     SWOOP(392,392,4,1,1000) };
+static const seg_t PH_SCREAM[]   = { VIB_NOTE(2730,4,1000,3) };
+static const seg_t PH_LOOK[]     = { SEG(2000,3000,4,4,100,50,1,50) };
+static const seg_t PH_CONTENT[]  = { SEG(200,200,4,4,1000,10,1,10)};
+static const seg_t PH_LAUGH[]    = { SEG(2000,3000,4,3,1000,10,1,10)};
 
 #define PHRASE(name, segs) { name, segs, sizeof(segs) / sizeof(seg_t) }
 static const struct { const char *name; const seg_t *segs; int n; }
@@ -280,6 +284,10 @@ PHRASES[] = {
     PHRASE("alert",    PH_ALERT),
     PHRASE("ta-da",    PH_TADA),
     PHRASE("uh-oh",    PH_UHOH),
+    PHRASE("scream",   PH_SCREAM),
+    PHRASE("look",     PH_LOOK),
+    PHRASE("content",  PH_CONTENT),
+    PHRASE("laugh",    PH_LAUGH),
 };
 #define PHRASE_N ((int)(sizeof PHRASES / sizeof PHRASES[0]))
 
