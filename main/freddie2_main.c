@@ -560,6 +560,8 @@ static void help(void)
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
     printf("  c                     grab a camera frame, report size/timing\n");
+    printf("  j                     dump a camera frame as base64 jpeg\n");
+    printf("                        (tools/grab_frame.py fetches + decodes it)\n");
     printf("  ?                     this help\n");
     printf("[secs] defaults to %d; 0 = run until `s`.\n", RUN_DEFAULT_S);
 }
@@ -615,6 +617,40 @@ static void handle_line(const char *line)
         printf("frame: %ux%u, %u bytes jpeg, %lld ms\n",
                fb->width, fb->height, (unsigned)fb->len,
                (esp_timer_get_time() - t0) / 1000);
+        esp_camera_fb_return(fb);
+        break;
+    }
+    case 'j': {
+        if (!cam_ok) {
+            printf("no camera.\n");
+            break;
+        }
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            printf("capture failed.\n");
+            break;
+        }
+        /* Base64 between markers, 76-char lines — tools/grab_frame.py
+         * on the host turns this into a .jpg. */
+        static const char B64[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        printf("JPEG-BEGIN %u\n", (unsigned)fb->len);
+        const uint8_t *p = fb->buf;
+        for (size_t i = 0; i < fb->len; i += 3) {
+            uint32_t v = (uint32_t)p[i] << 16 |
+                         (i + 1 < fb->len ? p[i + 1] : 0) << 8 |
+                         (i + 2 < fb->len ? p[i + 2] : 0);
+            char quad[5] = {
+                B64[v >> 18], B64[(v >> 12) & 63],
+                i + 1 < fb->len ? B64[(v >> 6) & 63] : '=',
+                i + 2 < fb->len ? B64[v & 63] : '=',
+                0,
+            };
+            fputs(quad, stdout);
+            if ((i / 3 + 1) % 19 == 0)
+                putchar('\n');
+        }
+        printf("\nJPEG-END\n");
         esp_camera_fb_return(fb);
         break;
     }
