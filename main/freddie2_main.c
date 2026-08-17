@@ -45,14 +45,14 @@ static const struct { int en, ph; } MOTOR_GPIO[MOTOR_N] = {
  * Verified with `t` on the wired chassis: M1=FL, M2=FR, M3=RL(back left),
  * M4=RR, and all four spin the same way with no polarity flips. Any
  * future rewiring gets corrected once here so drive() stays sane. */
-#define FL_CH 0
-#define FR_CH 1
-#define RL_CH 2
-#define RR_CH 3
-#define FL_POL (+1)
-#define FR_POL (+1)
-#define RL_POL (+1)
-#define RR_POL (+1)
+#define FL_CH 3
+#define FR_CH 2
+#define RL_CH 1
+#define RR_CH 0
+#define FL_POL (-1)
+#define FR_POL (-1)
+#define RL_POL (-1)
+#define RR_POL (-1)
 
 #define RUN_DEFAULT_S 3   /* auto-stop delay when a command gives no duration */
 
