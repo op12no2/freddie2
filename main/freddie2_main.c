@@ -330,54 +330,14 @@ static bool seg_play(const seg_t *s)
  * asking, falling = negative/tired. All timings are draft; tuning them
  * is an ongoing pastime. */
 
-static const seg_t PH_HELLO[]    = { NOTE(1047,4,90), REST(20),
-                                     NOTE(1319,4,90), REST(20),
-                                     NOTE(1568,4,120) };
-static const seg_t PH_YES[]      = { NOTE(1175,4,80), REST(25),
-                                     NOTE(1760,4,140) };
-static const seg_t PH_NO[]       = { NOTE(494,4,120), REST(30),
-                                     NOTE(370,4,180) };
-static const seg_t PH_QUESTION[] = { NOTE(880,4,100), REST(30),
-                                     NOTE(988,4,80), REST(20),
-                                     GLIDE(1200,1750,4,180) };
-static const seg_t PH_HAPPY[]    = { NOTE(1047,4,70), REST(15),
-                                     NOTE(1319,4,70), REST(15),
-                                     NOTE(1568,4,70), REST(15),
-                                     NOTE(2093,4,140), REST(20),
-                                     NOTE(1568,4,70) };
-static const seg_t PH_SAD[]      = { NOTE(784,4,150), REST(40),
-                                     NOTE(659,4,150), REST(40),
-                                     SWOOP(523,440,4,3,260) };
-static const seg_t PH_ALERT[]    = { NOTE(2400,4,90), REST(60),
-                                     NOTE(2400,4,90), REST(60),
-                                     NOTE(2400,4,90) };
-static const seg_t PH_TADA[]     = { NOTE(523,4,110), REST(20),
-                                     NOTE(659,4,110), REST(20),
-                                     NOTE(784,4,110), REST(20),
-                                     VIB_NOTE(1047,4,320,3) };
-static const seg_t PH_UHOH[]     = { NOTE(587,4,200), REST(80),
-                                     SWOOP(392,392,4,1,1000) };
-static const seg_t PH_SCREAM[]   = { VIB_NOTE(2730,4,1000,3) };
-static const seg_t PH_LOOK[]     = { SEG(2000,3000,4,4,100,50,1,50) };
-static const seg_t PH_CONTENT[]  = { SEG(200,200,4,4,1000,10,1,10)};
-static const seg_t PH_LAUGH[]    = { SEG(2000,3000,4,3,1000,10,1,10)};
+#define PH_HELLO_INDEX 0
+
+static const seg_t PH_HELLO[]    = { NOTE(880,4,100), REST(30), NOTE(988,4,80), REST(20), GLIDE(1200,1750,4,180) };
 
 #define PHRASE(name, segs) { name, segs, sizeof(segs) / sizeof(seg_t) }
 static const struct { const char *name; const seg_t *segs; int n; }
 PHRASES[] = {
     PHRASE("hello",    PH_HELLO),
-    PHRASE("yes",      PH_YES),
-    PHRASE("no",       PH_NO),
-    PHRASE("question", PH_QUESTION),
-    PHRASE("happy",    PH_HAPPY),
-    PHRASE("sad",      PH_SAD),
-    PHRASE("alert",    PH_ALERT),
-    PHRASE("ta-da",    PH_TADA),
-    PHRASE("uh-oh",    PH_UHOH),
-    PHRASE("scream",   PH_SCREAM),
-    PHRASE("look",     PH_LOOK),
-    PHRASE("content",  PH_CONTENT),
-    PHRASE("laugh",    PH_LAUGH),
 };
 #define PHRASE_N ((int)(sizeof PHRASES / sizeof PHRASES[0]))
 
@@ -563,10 +523,6 @@ static void floor_test(int countdown)
         { -50, -50,   0, 1000, "diagonal back-left" },
         { -50,  50,   0, 1000, "diagonal front-left" },
         {  50, -50,   0, 1000, "diagonal back-right" },
-        {   0,  55,  30, 1500, "arc right, out" },
-        {   0, -55, -30, 1500, "arc right, back" },
-        {   0,  55, -30, 1500, "arc left, out" },
-        {   0, -55,  30, 1500, "arc left, back" },
         {   0,   0,  50, 1000, "rotate cw" },
         {   0,   0, -50, 1000, "rotate ccw" },
     };
@@ -796,6 +752,8 @@ void app_main(void)
 
     setvbuf(stdin, NULL, _IONBF, 0);
     help();
+
+    phrase_play(PH_HELLO_INDEX);
 
     char line[96];
     size_t len = 0;
