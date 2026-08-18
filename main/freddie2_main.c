@@ -17,13 +17,17 @@
 #include "driver/ledc.h"
 #include "driver/uart.h"
 #include "esp_chip_info.h"
+#include "esp_event.h"
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_now.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "freddie2";
 
@@ -352,8 +356,9 @@ static bool phrase_play(int idx)
 
 /* Random babble: a generator emitting random segments — mostly quick
  * chirps (base pitch shifted up 0-3 octaves so the spread sounds musical,
- * ~200 Hz to ~3.2 kHz), with the occasional short jittery swoop. */
-static void babble(int secs)
+ * ~200 Hz to ~3.2 kHz), with the occasional short jittery swoop. False
+ * if a key (or missing buzzer) cut it short. */
+static bool babble(int secs)
 {
     printf("babbling for %d s — any key stops.\n", secs);
     int64_t end = esp_timer_get_time() + (int64_t)secs * 1000000;
@@ -367,10 +372,11 @@ static void babble(int secs)
             s = (seg_t)NOTE(hz, 4, rnd_range(40, 250));
         }
         if (!seg_play(&s))
-            return;
+            return false;
         if (wait_or_key(rnd_range(10, 130)))
-            return;
+            return false;
     }
+    return true;
 }
 
 static void vocab_run_through(void)
@@ -469,6 +475,78 @@ static void drive(int x, int y, int r)
     motor_set(RR_CH, RR_POL * rr * 100 / m);
 }
 
+/* ----------------------------------------------------------------- watch */
+
+/* Idle behavior: sit still and watch the radar; when somebody comes
+ * close, greet them with a burst of babbles, then stay quiet until they
+ * have clearly gone before re-arming. Polled from the main loop between
+ * console commands — the distance is too noisy for anything finer than
+ * "somebody is close / nobody is", so the debounce counters do the work:
+ * a few consecutive close frames to greet, a few clear seconds to
+ * re-arm. Each poll drains the UART backlog and judges the freshest
+ * frame only. */
+
+#define WATCH_POLL_MS  300   /* radar look interval while idle */
+#define WATCH_CLOSE_CM 120   /* "visiting close" */
+#define WATCH_IN_N       3   /* consecutive close polls to greet (~1 s) */
+#define WATCH_OUT_N     15   /* consecutive clear polls to re-arm (~5 s) */
+
+static bool watch_on = true;
+static bool watch_occupied;   /* greeted; waiting for the visitor to leave */
+static int watch_streak;
+static int64_t watch_next_us;
+
+/* The greeting: 2-5 babbles of 1-3 s each, breathing pauses between. */
+static void watch_greet(void)
+{
+    phrase_play(PH_HELLO_INDEX);
+    int n = rnd_range(2, 5);
+    printf("visitor! %d babbles:\n", n);
+    for (int i = 0; i < n; i++) {
+        if (!babble(rnd_range(1, 3)))
+            return;
+        if (i < n - 1 && wait_or_key(rnd_range(300, 900)))
+            return;
+    }
+}
+
+/* One watch tick; true if it printed anything (so the caller can restore
+ * the prompt). */
+static bool watch_poll(void)
+{
+    if (!watch_on || !ld_ok)
+        return false;
+    int64_t now = esp_timer_get_time();
+    if (now < watch_next_us)
+        return false;
+    watch_next_us = now + (int64_t)WATCH_POLL_MS * 1000;
+
+    uart_flush_input(LD_UART);
+    ld_report_t r;
+    if (!ld_read(&r, 150))
+        return false;
+    bool close = (r.state & 3) && r.det_cm > 0 && r.det_cm <= WATCH_CLOSE_CM;
+
+    if (!watch_occupied) {
+        watch_streak = close ? watch_streak + 1 : 0;
+        if (watch_streak >= WATCH_IN_N) {
+            watch_greet();
+            watch_occupied = true;
+            watch_streak = 0;
+            return true;
+        }
+    } else {
+        watch_streak = close ? 0 : watch_streak + 1;
+        if (watch_streak >= WATCH_OUT_N) {
+            printf("visitor gone — watching again.\n");
+            watch_occupied = false;
+            watch_streak = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* --------------------------------------------------------------- console */
 
 /* Wheel-mapping test: each channel in turn, forward then reverse, so the
@@ -540,6 +618,220 @@ abort:
     printf("floor test aborted.\n");
 }
 
+/* --------------------------------------------------------------- esp-now */
+
+/* Freddie 1 broadcasts a 21-byte ESP-NOW frame to ff:ff:ff:ff:ff:ff every
+ * 100 ms, unencrypted, on channel 1 — no association, no AP, no IP stack.
+ * `n` brings the radio up just long enough to listen, then takes it down
+ * again: an unassociated station sits in receive at ~80 mA whether or not
+ * anything is being heard, and Freddie 2's boot is meant to stay quiet.
+ *
+ * Wire format, little-endian, packed; a later ver may append fields but
+ * the ones below never move, so `ver` mismatches are reported, not
+ * rejected. */
+#define BEACON_CHANNEL 1
+#define BEACON_MAGIC   "FRED"
+#define BEACON_VER     1
+#define BEACON_LISTEN_S 5   /* default listen window for `n` */
+
+typedef struct __attribute__((packed)) {
+    char     magic[4];   /* "FRED", not NUL-terminated */
+    uint8_t  ver;
+    char     id[8];      /* "freddie", NUL-padded */
+    uint32_t seq;        /* from 0 at boot; gaps are frames we lost */
+    uint32_t up_ms;      /* sender's uptime, so a reboot reads as one */
+} beacon_t;
+
+/* The receive callback runs in the WiFi task, where printf and anything
+ * else slow doesn't belong, so it only parks frames in this ring and the
+ * console loop does the talking. Single producer, single consumer, free
+ * running indices: no lock needed. */
+#define RX_RING 32
+typedef struct {
+    uint8_t  mac[6];
+    int8_t   rssi;
+    beacon_t b;
+} rx_frame_t;
+
+static rx_frame_t rx_ring[RX_RING];
+static volatile uint32_t rx_head, rx_tail;
+static volatile uint32_t rx_dropped;   /* ring was full: console too slow */
+static volatile uint32_t rx_alien;     /* ESP-NOW frames that weren't Freddie's */
+
+static bool radio_ready;   /* WiFi stack initialised (once, lazily) */
+
+static bool radio_fail(const char *what, esp_err_t err)
+{
+    printf("radio: %s failed (%s)\n", what, esp_err_to_name(err));
+    return false;
+}
+
+static void beacon_rx(const esp_now_recv_info_t *info,
+                      const uint8_t *data, int len)
+{
+    if (len < (int)sizeof(beacon_t) || memcmp(data, BEACON_MAGIC, 4) != 0) {
+        rx_alien++;
+        return;
+    }
+    uint32_t head = rx_head;
+    if (head - rx_tail >= RX_RING) {
+        rx_dropped++;
+        return;
+    }
+    rx_frame_t *f = &rx_ring[head % RX_RING];
+    memcpy(f->mac, info->src_addr, sizeof(f->mac));
+    f->rssi = info->rx_ctrl ? info->rx_ctrl->rssi : 0;
+    memcpy(&f->b, data, sizeof(f->b));
+    rx_head = head + 1;   /* publish last */
+}
+
+/* One-time: NVS (WiFi keeps its PHY calibration there), netif, event loop
+ * and the WiFi driver itself. Left standing once up — it's the radio, not
+ * the driver, that costs current. */
+static bool radio_init(void)
+{
+    if (radio_ready) return true;
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) return radio_fail("nvs init", err);
+    if ((err = esp_netif_init()) != ESP_OK)
+        return radio_fail("netif init", err);
+    if ((err = esp_event_loop_create_default()) != ESP_OK)
+        return radio_fail("event loop", err);
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    if ((err = esp_wifi_init(&cfg)) != ESP_OK)
+        return radio_fail("wifi init", err);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);   /* nothing to remember */
+    if ((err = esp_wifi_set_mode(WIFI_MODE_STA)) != ESP_OK)
+        return radio_fail("wifi mode", err);
+
+    radio_ready = true;
+    return true;
+}
+
+/* Channel is a property of a running radio, so it's re-stated every time.
+ * Receiving a broadcast needs no peer registration — just a callback. */
+static bool radio_listen_start(void)
+{
+    esp_err_t err;
+    if (!radio_init()) return false;
+    if ((err = esp_wifi_start()) != ESP_OK)
+        return radio_fail("wifi start", err);
+    if ((err = esp_wifi_set_channel(BEACON_CHANNEL, WIFI_SECOND_CHAN_NONE))
+            != ESP_OK) {
+        esp_wifi_stop();
+        return radio_fail("set channel", err);
+    }
+    if ((err = esp_now_init()) != ESP_OK) {
+        esp_wifi_stop();
+        return radio_fail("esp-now init", err);
+    }
+    if ((err = esp_now_register_recv_cb(beacon_rx)) != ESP_OK) {
+        esp_now_deinit();
+        esp_wifi_stop();
+        return radio_fail("register rx", err);
+    }
+    return true;
+}
+
+static void radio_listen_stop(void)
+{
+    esp_now_unregister_recv_cb();
+    esp_now_deinit();
+    esp_wifi_stop();   /* the radio genuinely goes down, not just the callback */
+}
+
+/* Listen for `secs` seconds (or until a key), printing every Freddie frame
+ * as it lands and a summary at the end. Frames are only expected while the
+ * other robot's beacon is on — silence here is as likely to be his `n` as
+ * a problem at this end. */
+static void beacon_listen(int secs)
+{
+    if (!radio_listen_start()) return;
+
+    rx_head = rx_tail = 0;
+    rx_dropped = rx_alien = 0;
+
+    printf("listening for \"FRED\" on channel %d for %d s — any key stops.\n",
+           BEACON_CHANNEL, secs);
+
+    int64_t end_us = esp_timer_get_time() + (int64_t)secs * 1000000;
+    uint32_t heard = 0, lost = 0, gaps = 0, reboots = 0, last_seq = 0;
+    int rssi_min = 127, rssi_max = -128, rssi_sum = 0;
+    bool have_last = false, said_who = false;
+
+    while (esp_timer_get_time() < end_us) {
+        if (key_poll() != EOF) break;
+
+        while (rx_tail != rx_head) {
+            rx_frame_t f = rx_ring[rx_tail % RX_RING];
+            rx_tail++;
+
+            if (!said_who) {
+                printf("heard \"%.8s\" (ver %u) from "
+                       "%02x:%02x:%02x:%02x:%02x:%02x\n",
+                       f.b.id, f.b.ver, f.mac[0], f.mac[1], f.mac[2],
+                       f.mac[3], f.mac[4], f.mac[5]);
+                if (f.b.ver != BEACON_VER)
+                    printf("(expected ver %d — fields may have moved)\n",
+                           BEACON_VER);
+                said_who = true;
+            }
+
+            if (have_last) {
+                if (f.b.seq < last_seq) {
+                    reboots++;
+                    printf("  -- seq restarted: he rebooted\n");
+                } else if (f.b.seq > last_seq + 1) {
+                    gaps++;
+                    lost += f.b.seq - last_seq - 1;
+                }
+            }
+            last_seq = f.b.seq;
+            have_last = true;
+
+            heard++;
+            if (f.rssi < rssi_min) rssi_min = f.rssi;
+            if (f.rssi > rssi_max) rssi_max = f.rssi;
+            rssi_sum += f.rssi;
+
+            printf("seq %-6lu up %6lu.%lu s  rssi %4d\n",
+                   (unsigned long)f.b.seq,
+                   (unsigned long)(f.b.up_ms / 1000),
+                   (unsigned long)((f.b.up_ms % 1000) / 100),
+                   f.rssi);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    radio_listen_stop();
+
+    if (heard == 0) {
+        printf("nothing heard in %d s — is his beacon on, and on channel %d?\n",
+               secs, BEACON_CHANNEL);
+    } else {
+        printf("%lu frames, %lu lost in %lu gap(s), rssi %d..%d avg %d\n",
+               (unsigned long)heard, (unsigned long)lost,
+               (unsigned long)gaps, rssi_min, rssi_max,
+               rssi_sum / (int)heard);
+        if (reboots)
+            printf("%lu reboot(s) seen.\n", (unsigned long)reboots);
+    }
+    if (rx_dropped)
+        printf("(%lu frames dropped: console couldn't keep up)\n",
+               (unsigned long)rx_dropped);
+    if (rx_alien)
+        printf("(%lu other esp-now frame(s) on this channel, not Freddie's)\n",
+               (unsigned long)rx_alien);
+    printf("radio down.\n");
+}
+
 static void help(void)
 {
     printf("commands:\n");
@@ -561,6 +853,11 @@ static void help(void)
     printf("  s                     stop all motors\n");
     printf("  v                     show commanded motor values\n");
     printf("  h                     stream human-radar readings until a key\n");
+    printf("  n [secs]              listen for Freddie 1's esp-now beacon\n");
+    printf("                        (default %d s; radio is off otherwise)\n",
+           BEACON_LISTEN_S);
+    printf("  w                     toggle the visitor watch (now %s)\n",
+           watch_on ? "on" : "off");
     printf("  ?                     this help\n");
     printf("[secs] defaults to %d; 0 = run until `s`.\n", RUN_DEFAULT_S);
 }
@@ -576,6 +873,12 @@ static void handle_line(const char *line)
     case 's':
         motors_stop();
         printf("stopped.\n");
+        break;
+    case 'w':
+        watch_on = !watch_on;
+        watch_occupied = false;
+        watch_streak = 0;
+        printf("watch %s.\n", watch_on ? "on" : "off");
         break;
     case 'v':
         for (int i = 0; i < MOTOR_N; i++)
@@ -628,6 +931,13 @@ static void handle_line(const char *line)
         }
         break;
     }
+    case 'n':
+        a = BEACON_LISTEN_S;
+        sscanf(line + 1, "%d", &a);
+        if (a < 1) a = 1;
+        if (a > 300) a = 300;
+        beacon_listen(a);
+        break;
     case 'q': {
         seg_t s = { 0, 0, 4, 4, 200, 0, 0, 0 };
         int hz0, hz1, v0 = 4, v1 = 4, ms = 200, vib = 0, trem = 0, jit = 0;
@@ -764,6 +1074,11 @@ void app_main(void)
         if (motor_stop_at_us && esp_timer_get_time() >= motor_stop_at_us) {
             motors_stop();
             printf("auto-stop.\n> ");
+        }
+
+        if (watch_poll()) {
+            printf("> ");
+            fflush(stdout);
         }
 
         int ch = key_poll();

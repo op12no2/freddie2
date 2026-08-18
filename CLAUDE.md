@@ -15,8 +15,9 @@ chip info at boot, peripheral init, then single-letter commands over the
 USB-C console (`?` prints the list). All hardware is wired and verified:
 motors (`t` wheel test, `m`/`a`/`d` drive, `x` floor demo, `s` stop),
 Qwiic buzzer (`b` beep, `p` vocab phrases, `r` babble, `g` glide, `q`
-raw sound segment), and the LD2410C radar (`h` live stream). Boot is
-deliberately quiet — no sounds or motion until commanded.
+raw sound segment), and the LD2410C radar (`h` live stream). `n` listens
+for Freddie 1's ESP-NOW beacon (see below). Boot is deliberately quiet —
+no sounds or motion until commanded.
 
 The next chapter is behavioral code: a Freddie 1-style single tick task
 and a watcher that reacts to the radar (someone arriving/approaching/
@@ -105,6 +106,22 @@ Motor-related jumpers, all shorted in this build: the PMODE jumper
 mode) and per-channel EN/PH jumpers (e.g. M1EN/M1PH) that connect the
 ESP32 GPIOs to the driver inputs. A popped EN/PH jumper looks exactly
 like a dead motor channel — check them before debugging firmware.
+
+**ESP-NOW link to Freddie 1** (verified with the `n` console command
+against the real beacon — Freddie 1's STA MAC is 14:c1:9f:35:35:fc, heard
+at about -41 dBm across a room with no dropped frames): Freddie 1
+broadcasts a 21-byte frame to ff:ff:ff:ff:ff:ff every 100 ms,
+unencrypted, on channel 1 — magic "FRED",
+ver 1, id "freddie" (8 bytes, NUL-padded), then u32 LE seq and u32 LE
+up_ms. `n` brings WiFi up in unassociated STA mode on channel 1, registers
+an ESP-NOW receive callback (a broadcast needs no peer registration),
+prints each frame with its RSSI, then takes the radio down again with
+`esp_wifi_stop()` and summarises frames/gaps/RSSI. The radio is off at
+boot and between listens on purpose: an unassociated station sits in
+receive at ~80 mA regardless of traffic. Nothing heard usually means
+Freddie 1's beacon is off (`n` at *his* console toggles it) rather than a
+fault here. The receive callback runs in the WiFi task, so it only parks
+frames in a small ring; the console loop prints them.
 
 **I2C**: GPIO 1 (SDA), GPIO 2 (SCL). On the bus: SparkFun Qwiic Buzzer
 at 0x34 (ATtiny register map — freq/volume/duration/active registers,
