@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="theme-color" content="#6d28d9">
+<title>Freddie</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #fef6e4;
+    color: #1e293b;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 1.2rem;
+    gap: 1rem;
+    max-width: 30rem;
+    margin: 0 auto;
+  }
+  header { text-align: center; }
+  header img { width: 96px; height: 96px; border-radius: 24px; }
+  h1 { font-size: 2rem; color: #6d28d9; margin-top: .3rem; }
+  #status {
+    font-size: 1rem;
+    padding: .35rem 1rem;
+    border-radius: 999px;
+    background: #e2e8f0;
+    color: #475569;
+  }
+  #status.on { background: #dcfce7; color: #166534; }
+  button {
+    font-family: inherit;
+    font-size: 1.5rem;
+    font-weight: 700;
+    border: none;
+    border-radius: 20px;
+    padding: 1rem;
+    cursor: pointer;
+    width: 100%;
+    color: #fff;
+    box-shadow: 0 4px 0 rgba(0,0,0,.18);
+    transition: transform .05s;
+  }
+  button:active { transform: translateY(3px); box-shadow: 0 1px 0 rgba(0,0,0,.18); }
+  button:disabled { opacity: .35; cursor: default; }
+  #connect { background: #6d28d9; font-size: 1.6rem; }
+  .actions { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; width: 100%; }
+  .actions button { font-size: 1.25rem; }
+  #hello  { background: #f59e0b; grid-column: span 2; font-size: 1.6rem; padding: 1.4rem; }
+  #babble { background: #10b981; }
+  #whistle{ background: #3b82f6; }
+  #beep   { background: #ec4899; }
+  #stop   { background: #ef4444; }
+  #nobt {
+    display: none;
+    background: #fee2e2;
+    color: #991b1b;
+    border-radius: 12px;
+    padding: 1rem;
+    font-size: .95rem;
+    line-height: 1.45;
+  }
+  details { width: 100%; color: #64748b; }
+  summary { cursor: pointer; font-size: .9rem; }
+  .console { display: flex; gap: .5rem; margin-top: .6rem; }
+  .console input {
+    flex: 1;
+    font: 1rem/1.4 ui-monospace, monospace;
+    padding: .55rem .7rem;
+    border: 2px solid #cbd5e1;
+    border-radius: 10px;
+    background: #fff;
+    color: inherit;
+  }
+  .console button { width: auto; font-size: 1rem; padding: .55rem 1rem; background: #475569; border-radius: 10px; }
+  footer { font-size: .75rem; color: #94a3b8; text-align: center; margin-top: auto; }
+</style>
+</head>
+<body>
+<header>
+  <img src="icon-192.png" alt="">
+  <h1>Freddie</h1>
+</header>
+
+<div id="status">not connected</div>
+<div id="nobt">This browser can't talk Bluetooth. Use <b>Chrome</b> or <b>Edge</b> on
+Android, Windows, Mac or Linux. On an iPhone or iPad, try the <b>Bluefy</b> app.</div>
+
+<button id="connect">🔗 Connect to Freddie</button>
+
+<div class="actions">
+  <button id="hello"  disabled>👋 Say hello</button>
+  <button id="babble" disabled>🗣️ Babble</button>
+  <button id="whistle" disabled>🎶 Whistle</button>
+  <button id="beep"   disabled>🔔 Beep</button>
+  <button id="stop"   disabled style="grid-column: span 2">🛑 Stop</button>
+</div>
+
+<details>
+  <summary>console</summary>
+  <form class="console" id="rawform">
+    <input id="raw" placeholder="p 0" autocomplete="off" autocapitalize="none">
+    <button>send</button>
+  </form>
+</details>
+
+<footer>Freddie 2 · Web Bluetooth remote</footer>
+
+<script>
+'use strict';
+/* Must match BLE_SVC_UUID / BLE_CMD_UUID in main/freddie2_main.c
+ * ("FRED","DIE2" in ASCII hex). Web Bluetooth wants them lowercase. */
+const SVC = '46524544-4449-4532-8000-000000000001';
+const CMD = '46524544-4449-4532-8000-000000000002';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+let device = null, chr = null, writing = Promise.resolve();
+
+function setUI(connected) {
+  statusEl.textContent = connected ? 'connected!' : 'not connected';
+  statusEl.classList.toggle('on', connected);
+  $('connect').textContent = connected ? '🔗 Disconnect'
+      : (device ? '🔗 Reconnect' : '🔗 Connect to Freddie');
+  for (const id of ['hello', 'babble', 'whistle', 'beep', 'stop'])
+    $(id).disabled = !connected;
+}
+
+/* Each write is one console line, e.g. "p 0". Chained so taps can't
+ * overlap: a GATT characteristic rejects concurrent operations. */
+function send(line) {
+  if (!chr) return;
+  const data = new TextEncoder().encode(line);
+  writing = writing.then(() => chr.writeValue(data)).catch(() => {});
+}
+
+async function connect() {
+  try {
+    if (!device) {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'freddie2' }],
+        optionalServices: [SVC],
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        chr = null;
+        setUI(false);
+      });
+    }
+    statusEl.textContent = 'connecting…';
+    const gatt = await device.gatt.connect();
+    const svc = await gatt.getPrimaryService(SVC);
+    chr = await svc.getCharacteristic(CMD);
+    setUI(true);
+  } catch (e) {
+    chr = null;
+    if (device && !device.gatt.connected) setUI(false);
+    if (e.name !== 'NotFoundError')   /* chooser cancelled = not an error */
+      statusEl.textContent = 'no luck — is Freddie\'s ble on? (l at his console)';
+  }
+}
+
+$('connect').addEventListener('click', () => {
+  if (chr) { device.gatt.disconnect(); return; }
+  connect();
+});
+$('hello').addEventListener('click', () => send('p 0'));
+$('babble').addEventListener('click', () => send('r 3'));
+$('whistle').addEventListener('click', () => send('g 400 2400 500'));
+$('beep').addEventListener('click', () => send('b'));
+$('stop').addEventListener('click', () => send('s'));
+$('rawform').addEventListener('submit', e => {
+  e.preventDefault();
+  const line = $('raw').value.trim();
+  if (line) send(line);
+  $('raw').value = '';
+});
+
+if (!navigator.bluetooth) {
+  $('nobt').style.display = 'block';
+  $('connect').disabled = true;
+}
+
+if ('serviceWorker' in navigator)
+  navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>

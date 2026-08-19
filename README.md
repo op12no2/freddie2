@@ -2,6 +2,13 @@
 
 A little autonomous robot.
 
+## Remote
+
+A Web Bluetooth remote (works offline as an installable PWA) lives in
+`docs/` and is served at <https://op12no2.github.io/freddie2/>. Type `l`
+at Freddie's console to start BLE advertising, then Connect from Chrome
+or Edge (no iPhone/iPad Safari — Apple doesn't do Web Bluetooth).
+
 ## Parts
 
 Excluding build choices and stock components.

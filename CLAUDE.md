@@ -16,8 +16,10 @@ USB-C console (`?` prints the list). All hardware is wired and verified:
 motors (`t` wheel test, `m`/`a`/`d` drive, `x` floor demo, `s` stop),
 Qwiic buzzer (`b` beep, `p` vocab phrases, `r` babble, `g` glide, `q`
 raw sound segment), and the LD2410C radar (`h` live stream). `n` listens
-for Freddie 1's ESP-NOW beacon (see below). Boot is deliberately quiet —
-no sounds or motion until commanded.
+for Freddie 1's ESP-NOW beacon (see below). `w` toggles the visitor
+watch (radar-triggered greeting). `l` toggles the BLE console link (see
+below). Boot is deliberately quiet — no sounds or motion until
+commanded.
 
 The next chapter is behavioral code: a Freddie 1-style single tick task
 and a watcher that reacts to the radar (someone arriving/approaching/
@@ -123,6 +125,22 @@ Freddie 1's beacon is off (`n` at *his* console toggles it) rather than a
 fault here. The receive callback runs in the WiFi task, so it only parks
 frames in a small ring; the console loop prints them.
 
+**BLE console link** (`l` command): a NimBLE GATT server — service UUID
+`46524544-4449-4532-8000-000000000001` ("FRED","DIE2" in ASCII hex),
+one write characteristic ending `...0002` — where every write is a
+console line in the prompt's own syntax, so the web remote gains new
+commands for free. The matching PWA is `docs/index.html`, served by
+GitHub Pages at https://op12no2.github.io/freddie2/ and offline-capable
+via its service worker (bump the cache name in `docs/sw.js` when any
+docs/ file changes). Web Bluetooth needs Chrome/Edge — no Safari/iOS.
+Advertising is off at boot per the quiet-boot rule; `l` toggles it (the
+NimBLE stack starts lazily on first use and stays up). Writes land in
+the NimBLE host task and are parked in a one-line letterbox for the main
+loop, like the ESP-NOW ring; `h`/`n`/`l` are refused over BLE (they'd
+hog the loop or fight the link). Motors stop on BLE disconnect — keep
+that dead-man property when drive-by-gesture arrives. WiFi/BLE
+coexistence is enabled, so `n` still works with the link up.
+
 **I2C**: GPIO 1 (SDA), GPIO 2 (SCL). On the bus: SparkFun Qwiic Buzzer
 at 0x34 (ATtiny register map — freq/volume/duration/active registers,
 probed at boot, `b` console command beeps it).
@@ -147,5 +165,7 @@ phone app when tuning is needed.
 - `sdkconfig.defaults` — target, flash size, PSRAM, console routing.
   `sdkconfig` is regenerated from it; put durable changes in
   `sdkconfig.defaults`.
+- `docs/` — the Web Bluetooth PWA remote (GitHub Pages serves this
+  directory) plus the board schematic PDF.
 - `README.md` — parts list, doc links, build instructions.
 - `build/` — generated, gitignored.

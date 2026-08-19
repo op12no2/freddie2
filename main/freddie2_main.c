@@ -27,7 +27,13 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
 #include "nvs_flash.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 static const char *TAG = "freddie2";
 
@@ -666,6 +672,23 @@ static bool radio_fail(const char *what, esp_err_t err)
     return false;
 }
 
+/* NVS backs both radios' PHY calibration; whoever comes up first inits it. */
+static bool nvs_init_once(void)
+{
+    static bool done;
+    if (done) return true;
+
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) return radio_fail("nvs init", err);
+    done = true;
+    return true;
+}
+
 static void beacon_rx(const esp_now_recv_info_t *info,
                       const uint8_t *data, int len)
 {
@@ -691,14 +714,9 @@ static void beacon_rx(const esp_now_recv_info_t *info,
 static bool radio_init(void)
 {
     if (radio_ready) return true;
+    if (!nvs_init_once()) return false;
 
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-    if (err != ESP_OK) return radio_fail("nvs init", err);
+    esp_err_t err;
     if ((err = esp_netif_init()) != ESP_OK)
         return radio_fail("netif init", err);
     if ((err = esp_event_loop_create_default()) != ESP_OK)
@@ -832,6 +850,218 @@ static void beacon_listen(int secs)
     printf("radio down.\n");
 }
 
+/* ------------------------------------------------------ ble console link */
+
+/* A NimBLE GATT server that exposes the console to Web Bluetooth: one
+ * service, one write characteristic, and every write is a console line
+ * in exactly the prompt's syntax. The matching web app lives in docs/
+ * (served by GitHub Pages), so a phone gets the whole vocabulary — hello,
+ * babble, driving — for free as commands are added here.
+ *
+ * Advertising is off at boot (quiet-boot rule); `l` toggles it. Writes
+ * arrive in the NimBLE host task, where slow work doesn't belong, so
+ * they're parked in a one-line letterbox for the main loop — same
+ * discipline as the esp-now ring. Two safety properties: motor commands
+ * keep their auto-stop, and a disconnect stops the motors outright, so
+ * a phone wandering out of range can't leave the robot driving. */
+
+#define BLE_NAME "freddie2"
+
+/* Service 46524544-4449-4532-8000-000000000001 — "FRED","DIE2" in ASCII
+ * hex — and command characteristic ...0002. NimBLE takes 128-bit UUIDs
+ * as bytes, least significant first. Must match docs/index.html. */
+static const ble_uuid128_t BLE_SVC_UUID =
+    BLE_UUID128_INIT(0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+                     0x32, 0x45, 0x49, 0x44, 0x44, 0x45, 0x52, 0x46);
+static const ble_uuid128_t BLE_CMD_UUID =
+    BLE_UUID128_INIT(0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+                     0x32, 0x45, 0x49, 0x44, 0x44, 0x45, 0x52, 0x46);
+
+static bool ble_started;    /* NimBLE stack up (once, lazily) */
+static bool ble_synced;     /* host ready; addresses sorted out */
+static bool ble_want_adv;   /* `l` wants us advertising */
+static uint8_t ble_addr_type;
+static uint16_t ble_conn = BLE_HS_CONN_HANDLE_NONE;
+
+/* Letterbox, host task -> main loop. The host task only writes when
+ * `full` is clear and sets it last; the main loop copies the line out
+ * before clearing. One slot is plenty: the main loop drains it every
+ * ~20 ms, and a stream of drive vectors wants latest-wins anyway. */
+static char ble_line[96];
+static volatile bool ble_line_full;
+static volatile int8_t ble_note;   /* +1 connected, -1 disconnected */
+
+static int ble_gap_event(struct ble_gap_event *ev, void *arg);
+
+static void ble_advertise(void)
+{
+    struct ble_hs_adv_fields fields = { 0 }, rsp = { 0 };
+
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)BLE_NAME;
+    fields.name_len = strlen(BLE_NAME);
+    fields.name_is_complete = 1;
+
+    /* The 128-bit service UUID doesn't fit next to the name in the
+     * 31-byte advertisement, so it rides in the scan response. */
+    rsp.uuids128 = (ble_uuid128_t *)&BLE_SVC_UUID;
+    rsp.num_uuids128 = 1;
+    rsp.uuids128_is_complete = 1;
+
+    struct ble_gap_adv_params params = {
+        .conn_mode = BLE_GAP_CONN_MODE_UND,
+        .disc_mode = BLE_GAP_DISC_MODE_GEN,
+    };
+
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc == 0) rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc == 0) rc = ble_gap_adv_start(ble_addr_type, NULL, BLE_HS_FOREVER,
+                                        &params, ble_gap_event, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY)
+        printf("ble: advertise failed (rc %d)\n", rc);
+}
+
+static int ble_gap_event(struct ble_gap_event *ev, void *arg)
+{
+    switch (ev->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        if (ev->connect.status == 0) {
+            ble_conn = ev->connect.conn_handle;
+            ble_note = 1;
+        } else if (ble_want_adv) {
+            ble_advertise();
+        }
+        break;
+    case BLE_GAP_EVENT_DISCONNECT:
+        ble_conn = BLE_HS_CONN_HANDLE_NONE;
+        motors_stop();   /* dead man's rule: no phone, no motion */
+        ble_note = -1;
+        if (ble_want_adv)
+            ble_advertise();
+        break;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+        if (ble_want_adv)
+            ble_advertise();
+        break;
+    }
+    return 0;
+}
+
+static int ble_cmd_access(uint16_t conn_handle, uint16_t attr_handle,
+                          struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR)
+        return BLE_ATT_ERR_UNLIKELY;
+    if (ble_line_full)   /* main loop busy; drop, latest-wins */
+        return 0;
+
+    uint16_t len = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, ble_line, sizeof ble_line - 1, &len) != 0)
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    while (len && (ble_line[len - 1] == '\r' || ble_line[len - 1] == '\n'))
+        len--;
+    ble_line[len] = '\0';
+    ble_line_full = true;   /* publish last */
+    return 0;
+}
+
+static const struct ble_gatt_svc_def BLE_SVCS[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &BLE_SVC_UUID.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = &BLE_CMD_UUID.u,
+                .access_cb = ble_cmd_access,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            { 0 },
+        },
+    },
+    { 0 },
+};
+
+static void ble_on_reset(int reason)
+{
+    ble_synced = false;
+}
+
+static void ble_on_sync(void)
+{
+    if (ble_hs_util_ensure_addr(0) != 0 ||
+        ble_hs_id_infer_auto(0, &ble_addr_type) != 0)
+        return;
+    ble_synced = true;
+    if (ble_want_adv)
+        ble_advertise();
+}
+
+static void ble_host_task(void *param)
+{
+    nimble_port_run();   /* returns only if the stack is stopped */
+    nimble_port_freertos_deinit();
+}
+
+static bool ble_start(void)
+{
+    if (ble_started) return true;
+    if (!nvs_init_once()) return false;
+
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        printf("ble: nimble init failed (%s)\n", esp_err_to_name(err));
+        return false;
+    }
+    ble_hs_cfg.reset_cb = ble_on_reset;
+    ble_hs_cfg.sync_cb = ble_on_sync;
+
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    int rc = ble_gatts_count_cfg(BLE_SVCS);
+    if (rc == 0) rc = ble_gatts_add_svcs(BLE_SVCS);
+    if (rc == 0) rc = ble_svc_gap_device_name_set(BLE_NAME);
+    if (rc != 0) {
+        printf("ble: gatt setup failed (rc %d)\n", rc);
+        return false;
+    }
+
+    nimble_port_freertos_init(ble_host_task);
+    ble_started = true;
+    return true;
+}
+
+static void handle_line(const char *line);
+
+/* One ble tick from the main loop: relay connect/disconnect notes and
+ * run a parked command line. True if it printed anything. */
+static bool ble_poll(void)
+{
+    bool printed = false;
+
+    int note = ble_note;
+    if (note) {
+        ble_note = 0;
+        printf(note > 0 ? "ble: connected.\n"
+                        : "ble: disconnected — motors stopped.\n");
+        printed = true;
+    }
+
+    if (ble_line_full) {
+        char line[sizeof ble_line];
+        memcpy(line, ble_line, sizeof line);
+        ble_line_full = false;
+        printf("ble> %s\n", line);
+        /* h and n hog the loop until a console key; l is the link's own
+         * switch. Those stay console-only. */
+        if (line[0] == 'h' || line[0] == 'n' || line[0] == 'l')
+            printf("(console-only command, ignored)\n");
+        else
+            handle_line(line);
+        printed = true;
+    }
+    return printed;
+}
+
 static void help(void)
 {
     printf("commands:\n");
@@ -858,6 +1088,9 @@ static void help(void)
            BEACON_LISTEN_S);
     printf("  w                     toggle the visitor watch (now %s)\n",
            watch_on ? "on" : "off");
+    printf("  l                     toggle the ble link for the web app\n");
+    printf("                        (advertises as \"%s\"; off at boot)\n",
+           BLE_NAME);
     printf("  ?                     this help\n");
     printf("[secs] defaults to %d; 0 = run until `s`.\n", RUN_DEFAULT_S);
 }
@@ -873,6 +1106,26 @@ static void handle_line(const char *line)
     case 's':
         motors_stop();
         printf("stopped.\n");
+        break;
+    case 'l':
+        if (!ble_started) {
+            ble_want_adv = true;   /* before start: sync may beat us */
+            if (ble_start())
+                printf("ble on — advertising as \"%s\".\n", BLE_NAME);
+            else
+                ble_want_adv = false;
+        } else if (ble_want_adv) {
+            ble_want_adv = false;
+            ble_gap_adv_stop();
+            if (ble_conn != BLE_HS_CONN_HANDLE_NONE)
+                ble_gap_terminate(ble_conn, BLE_ERR_REM_USER_CONN_TERM);
+            printf("ble off.\n");
+        } else {
+            ble_want_adv = true;
+            if (ble_synced)
+                ble_advertise();
+            printf("ble on — advertising as \"%s\".\n", BLE_NAME);
+        }
         break;
     case 'w':
         watch_on = !watch_on;
@@ -1077,6 +1330,11 @@ void app_main(void)
         }
 
         if (watch_poll()) {
+            printf("> ");
+            fflush(stdout);
+        }
+
+        if (ble_poll()) {
             printf("> ");
             fflush(stdout);
         }
