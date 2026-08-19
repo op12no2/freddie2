@@ -52,9 +52,11 @@ static const struct { int en, ph; } MOTOR_GPIO[MOTOR_N] = {
 };
 
 /* Wheel position -> motor channel (0..3 = M1..M4) and polarity (+1/-1).
- * Verified with `t` on the wired chassis: M1=FL, M2=FR, M3=RL(back left),
- * M4=RR, and all four spin the same way with no polarity flips. Any
- * future rewiring gets corrected once here so drive() stays sane. */
+ * The robot has been turned around (old back = new front), so the
+ * original `t`-verified mapping (M1=FL, M2=FR, M3=RL, M4=RR, all +1)
+ * became its 180-degree twin: M1=RR, M2=RL, M3=FR, M4=FL, every
+ * polarity flipped. Any future rewiring gets corrected once here so
+ * drive() stays sane. `t` and `m` address raw channels on purpose. */
 #define FL_CH 3
 #define FR_CH 2
 #define RL_CH 1
@@ -1069,7 +1071,7 @@ static void help(void)
     printf("  x [secs]              floor test: countdown (default 5), then\n");
     printf("                        fwd/back/strafe/rotate demo — unplug USB first\n");
     printf("  m <1-4> <pct> [secs]  one motor, pct -100..100\n");
-    printf("  a <pct> [secs]        all motors\n");
+    printf("  a <pct> [secs]        drive forward (+) or backward (-)\n");
     printf("  d <x> <y> <r> [secs]  mecanum drive: x strafe, y fwd, r rotate\n");
     printf("  b [hz] [ms] [vol]     beep (defaults %d Hz, 300 ms, vol 4;\n",
            BUZZER_DEFAULT_HZ);
@@ -1272,8 +1274,7 @@ static void handle_line(const char *line)
             printf("usage: a <pct> [secs]\n");
             break;
         }
-        for (int i = 0; i < MOTOR_N; i++)
-            motor_set(i, a);
+        drive(0, a, 0);
         run_for(secs);
         break;
     case 'd':
